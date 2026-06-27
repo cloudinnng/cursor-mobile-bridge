@@ -12,7 +12,18 @@
 
 - Node.js >= 18
 - 已安装并登录 Cursor Agent CLI（`agent login`）
-- Windows: `agent.cmd` 在 PATH 中（默认安装路径 `C:\Users\<用户>\AppData\Local\cursor-agent\`）
+- **Windows**: `agent.cmd` 在 PATH 中（默认 `%LOCALAPPDATA%\cursor-agent\`）
+- **macOS / Linux**: 安装 CLI 并确保 `agent` 可用：
+
+```bash
+curl https://cursor.com/install -fsSL | bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # 或 ~/.bashrc
+source ~/.zshrc
+agent login
+agent --version
+```
+
+也可通过环境变量指定可执行文件：`AGENT_COMMAND=/path/to/agent ./start-server.sh`
 
 ## 安装
 
@@ -25,6 +36,15 @@ npm install
 ```bash
 npm start
 ```
+
+或使用启动脚本（自动检查依赖、支持 `PORT` 环境变量）：
+
+| 平台 | 命令 |
+|------|------|
+| macOS / Linux | `./start-server.sh` |
+| Windows | 双击 `start-server.bat` |
+
+首次使用 shell 脚本需赋予执行权限：`chmod +x *.sh`
 
 启动后终端会打印局域网访问地址，例如：
 

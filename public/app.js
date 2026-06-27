@@ -55,7 +55,6 @@ const btnPickImage = document.getElementById("btnPickImage");
 const imagePreviewBar = document.getElementById("imagePreviewBar");
 /** @type {HTMLElement} */
 const inputArea = document.getElementById("inputArea");
-/** @type {HTMLButtonElement} */
 /** @type {HTMLButtonElement | null} */
 const btnScrollBottom = document.getElementById("btnScrollBottom");
 /** @type {HTMLElement | null} 标题栏内用户对话导航 */
@@ -135,16 +134,13 @@ let currentThoughtHeader = null;
 /** @type {string} 当前轮次 thought 原始累积（用于归一化后再展示） */
 let thoughtRawBuffer = "";
 
-/** @typedef {{ block: HTMLElement, header: HTMLElement, statusEl: HTMLElement, summaryEl: HTMLElement, body: HTMLElement, data: ToolUpdateData, toolCallIds: Set<string>, mergedParts: ToolUpdateData[] }} ToolBlockEntry */
+/** @typedef {{ block: HTMLElement, header: HTMLElement, statusEl: HTMLElement, body: HTMLElement, data: ToolUpdateData, toolCallIds: Set<string>, mergedParts: ToolUpdateData[], userToggled?: boolean }} ToolBlockEntry */
 
 /** @type {Map<string, ToolBlockEntry>} toolCallId -> 工具块（含合并组） */
 const toolBlocksMap = new Map();
 
 /** @type {Map<string, ToolBlockEntry>} 相同签名 -> 合并后的工具块 */
 const toolSignatureMap = new Map();
-
-/** @type {ToolBlockEntry[]} 当前轮次工具块顺序 */
-const toolBlockOrder = [];
 
 /** @type {Set<string>} 已写入历史的 toolCallId，避免重复 */
 const savedToolIds = new Set();
@@ -153,9 +149,6 @@ const savedToolIds = new Set();
 
 /** @type {number | null} 当前 ask_question 的 RPC id */
 let pendingAskId = null;
-
-/** @type {Record<string, string[]>} ask_question 用户选择 { questionId: [optionId] } */
-let askSelections = {};
 
 /** localStorage 键 */
 const STORAGE_KEY = "cursor-mobile-bridge-history";
@@ -205,17 +198,72 @@ const MAX_IMAGE_DIMENSION = 1920;
 /** @type {PendingImage[]} 待发送图片队列 */
 let pendingImages = [];
 
-/** @type {boolean} 正在应用服务器 sync 快照（避免重复写 DOM/历史） */
-let isApplyingSync = false;
+/** @type {number} 客户端已确认收到的最新 seq */
+let lastSeq = 0;
+
+/** @type {number | null} 服务端 epoch（hello 重连时携带） */
+let serverEpoch = null;
+
+/** @type {number | null} 客户端心跳 timer */
+let clientHeartbeatTimerId = null;
+
+/** @type {number | null} pong 超时 timer */
+let pongTimeoutId = null;
+
+/** 客户端 JSON ping 间隔（ms） */
+const CLIENT_HEARTBEAT_MS = 20_000;
+
+/** 等待 pong 超时（ms） */
+const CLIENT_PONG_TIMEOUT_MS = 10_000;
 
 // #endregion
 
 // #region WebSocket
 
 /**
+ * 停止客户端心跳
+ */
+function stopClientHeartbeat() {
+  if (clientHeartbeatTimerId !== null) {
+    clearInterval(clientHeartbeatTimerId);
+    clientHeartbeatTimerId = null;
+  }
+  if (pongTimeoutId !== null) {
+    clearTimeout(pongTimeoutId);
+    pongTimeoutId = null;
+  }
+}
+
+/**
+ * 启动客户端心跳 — 定期 ping，超时无 pong 则关闭连接触发重连
+ */
+function startClientHeartbeat() {
+  stopClientHeartbeat();
+  clientHeartbeatTimerId = window.setInterval(() => {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    console.log("[app] 发送 ping");
+    sendWs({ type: "ping" });
+    pongTimeoutId = window.setTimeout(() => {
+      console.warn("[app] pong 超时，关闭重连");
+      ws?.close();
+    }, CLIENT_PONG_TIMEOUT_MS);
+  }, CLIENT_HEARTBEAT_MS);
+}
+
+/**
+ * 向服务器发送 hello — 携带 epoch/lastSeq 以获取 replay 或 sync
+ */
+function sendHello() {
+  sendWs({ type: "hello", epoch: serverEpoch, lastSeq });
+  console.log("[app] 发送 hello epoch=", serverEpoch, "lastSeq=", lastSeq);
+}
+
+/**
  * 建立 WebSocket 连接（自动重连）
  */
 function connectWs() {
+  stopClientHeartbeat();
+
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${location.host}`;
 
@@ -227,12 +275,15 @@ function connectWs() {
   ws.onopen = () => {
     console.log("[app] WebSocket 已连接");
     setStatus("已连接", "connected");
+    sendHello();
+    startClientHeartbeat();
   };
 
   ws.onclose = () => {
+    stopClientHeartbeat();
     console.log("[app] WebSocket 断开，3s 后重连");
     setStatus("连接已断开，重连中...", "error");
-    // ponytail: 暂停本地计时，重连后 sync 会按服务器 turnStartedAt 恢复
+    // ponytail: 暂停本地计时，重连后 sync/replay 会按服务器 turnStartedAt 恢复
     if (agentTimerId !== null) {
       clearInterval(agentTimerId);
       agentTimerId = null;
@@ -273,20 +324,106 @@ function sendWs(msg) {
 // #region 服务器消息处理
 
 /**
+ * 跟踪服务端 seq / epoch
+ * @param {Record<string, unknown>} msg
+ */
+function trackSeq(msg) {
+  if (typeof msg.seq === "number") {
+    lastSeq = Math.max(lastSeq, msg.seq);
+  }
+  if (typeof msg.epoch === "number") {
+    serverEpoch = msg.epoch;
+  }
+}
+
+/**
+ * 处理增量 replay — 只回放 seq > lastSeq 的遗漏事件
+ * @param {Record<string, unknown>} msg
+ */
+function handleReplay(msg) {
+  console.log(
+    "[app] replay 收到 events=",
+    Array.isArray(msg.events) ? msg.events.length : 0,
+    "lastSeq=",
+    lastSeq
+  );
+
+  trackSeq(msg);
+  handleInit(msg);
+
+  if (msg.workspaceSwitchInFlight) {
+    setStatus("切换工作空间中...", "busy");
+  }
+
+  /** @type {Record<string, unknown>[]} */
+  const events = Array.isArray(msg.events)
+    ? /** @type {Record<string, unknown>[]} */ (msg.events)
+    : [];
+
+  if (events.length === 0) {
+    if (msg.promptInFlight) {
+      setBusy(true, typeof msg.turnStartedAt === "number" ? msg.turnStartedAt : null);
+    } else if (isBusy || agentFailed) {
+      setBusy(false);
+    }
+    if (msg.pendingAsk) {
+      showAskModal(/** @type {Record<string, unknown>} */ (msg.pendingAsk));
+    }
+    return;
+  }
+
+  for (const event of events) {
+    trackSeq(event);
+    applySyncEvent(event);
+  }
+
+  const last = events[events.length - 1];
+  if (msg.promptInFlight) {
+    setBusy(true, typeof msg.turnStartedAt === "number" ? msg.turnStartedAt : null);
+  } else if (last?.type === "error") {
+    const errMsg = String(last.message ?? "未知错误");
+    appendSystemMsg(`错误: ${errMsg}`);
+    setAgentFailed(errMsg);
+  } else if (last?.type === "cancelled") {
+    setBusy(false);
+  }
+
+  if (msg.pendingAsk) {
+    showAskModal(/** @type {Record<string, unknown>} */ (msg.pendingAsk));
+  }
+
+  scrollToBottom({ force: true });
+  console.log("[app] replay 增量回放完成 lastSeq=", lastSeq);
+}
+
+/**
  * 处理服务器推送的消息
  * @param {Record<string, unknown>} msg
  */
 function handleServerMessage(msg) {
   switch (msg.type) {
+    case "replay":
+      handleReplay(msg);
+      return;
+
+    case "pong":
+      if (pongTimeoutId !== null) {
+        clearTimeout(pongTimeoutId);
+        pongTimeoutId = null;
+      }
+      return;
+
     case "init":
       handleInit(msg);
       break;
 
     case "sync":
+      trackSeq(msg);
       handleSync(msg);
       break;
 
     case "user_message":
+      trackSeq(msg);
       appendUserBubble(
         /** @type {string} */ (msg.text),
         Array.isArray(msg.images) ? /** @type {PromptImage[]} */ (msg.images) : []
@@ -296,34 +433,42 @@ function handleServerMessage(msg) {
       break;
 
     case "thought":
+      trackSeq(msg);
       appendThoughtChunk(/** @type {string} */ (msg.text));
       break;
 
     case "message":
+      trackSeq(msg);
       appendAgentChunk(/** @type {string} */ (msg.text));
       break;
 
     case "tool":
+      trackSeq(msg);
       appendToolBlock(msg.update);
       break;
 
     case "plan":
+      trackSeq(msg);
       appendPlanCard(msg);
       break;
 
     case "todos":
+      trackSeq(msg);
       appendTodosCard(msg);
       break;
 
     case "task":
+      trackSeq(msg);
       appendSystemMsg(`子任务: ${msg.description}`);
       break;
 
     case "done":
+      trackSeq(msg);
       finishAgentReply(/** @type {string} */ (msg.stopReason));
       break;
 
     case "error": {
+      trackSeq(msg);
       const errMsg = String(msg.message ?? "未知错误");
       if (filePreviewRequestPath && filePreviewBody) {
         filePreviewBody.innerHTML = "";
@@ -344,6 +489,7 @@ function handleServerMessage(msg) {
     }
 
     case "cancelled":
+      trackSeq(msg);
       appendSystemMsg("已取消");
       setBusy(false);
       break;
@@ -357,6 +503,7 @@ function handleServerMessage(msg) {
       break;
 
     case "ask_question":
+      trackSeq(msg);
       showAskModal(msg);
       break;
 
@@ -476,14 +623,13 @@ function handleInit(msg) {
 
   // 填充模式
   if (Array.isArray(msg.modes)) {
-    selectMode.innerHTML = "";
-    for (const mode of /** @type {Array<{id:string,name:string}>} */ (msg.modes)) {
-      const opt = document.createElement("option");
-      opt.value = mode.id;
-      opt.textContent = mode.name;
-      selectMode.appendChild(opt);
-    }
-    if (msg.currentMode) selectMode.value = /** @type {string} */ (msg.currentMode);
+    fillSelect(
+      selectMode,
+      /** @type {Array<{id:string,name:string}>} */ (msg.modes),
+      (mode) => mode.id,
+      (mode) => mode.name,
+      msg.currentMode ? /** @type {string} */ (msg.currentMode) : undefined
+    );
   }
 
   // 填充模型（仅常用几项，避免下拉过长）
@@ -492,14 +638,13 @@ function handleInit(msg) {
     const currentModelId = msg.currentModel ? String(msg.currentModel) : undefined;
     const models = pickCommonModels(allModels, currentModelId);
 
-    selectModel.innerHTML = "";
-    for (const model of models) {
-      const opt = document.createElement("option");
-      opt.value = model.modelId;
-      opt.textContent = model.name;
-      selectModel.appendChild(opt);
-    }
-    if (currentModelId) selectModel.value = currentModelId;
+    fillSelect(
+      selectModel,
+      models,
+      (model) => model.modelId,
+      (model) => model.name,
+      currentModelId
+    );
   }
 }
 
@@ -686,41 +831,37 @@ function handleSync(msg) {
 
   removeIncompleteTurnFromDom();
 
-  isApplyingSync = true;
-  try {
-    resetTurnStreamingState();
+  resetTurnStreamingState();
 
-    const first = events[0];
-    const skipUserBubble = first?.type === "user_message" && isUserMessageAlreadyShown(first);
+  const first = events[0];
+  const skipUserBubble = first?.type === "user_message" && isUserMessageAlreadyShown(first);
 
-    for (const event of events) {
-      if (skipUserBubble && event.type === "user_message") {
-        resetTurnStreamingState();
-        continue;
-      }
-      applySyncEvent(event);
+  for (const event of events) {
+    if (skipUserBubble && event.type === "user_message") {
+      resetTurnStreamingState();
+      continue;
     }
-
-    const last = events[events.length - 1];
-    if (msg.promptInFlight) {
-      setBusy(true, typeof msg.turnStartedAt === "number" ? msg.turnStartedAt : null);
-    } else if (last?.type === "error") {
-      const errMsg = String(last.message ?? "未知错误");
-      appendSystemMsg(`错误: ${errMsg}`);
-      setAgentFailed(errMsg);
-    } else if (last?.type !== "cancelled" && last?.type !== "done") {
-      setBusy(false);
-    }
-
-    if (msg.pendingAsk) {
-      showAskModal(/** @type {Record<string, unknown>} */ (msg.pendingAsk));
-    }
-
-    scrollToBottom({ force: true });
-    console.log("[app] sync 回放完成");
-  } finally {
-    isApplyingSync = false;
+    trackSeq(event);
+    applySyncEvent(event);
   }
+
+  const last = events[events.length - 1];
+  if (msg.promptInFlight) {
+    setBusy(true, typeof msg.turnStartedAt === "number" ? msg.turnStartedAt : null);
+  } else if (last?.type === "error") {
+    const errMsg = String(last.message ?? "未知错误");
+    appendSystemMsg(`错误: ${errMsg}`);
+    setAgentFailed(errMsg);
+  } else if (last?.type !== "cancelled" && last?.type !== "done") {
+    setBusy(false);
+  }
+
+  if (msg.pendingAsk) {
+    showAskModal(/** @type {Record<string, unknown>} */ (msg.pendingAsk));
+  }
+
+  scrollToBottom({ force: true });
+  console.log("[app] sync 回放完成");
 }
 
 // #endregion
@@ -728,11 +869,11 @@ function handleSync(msg) {
 // #region 消息渲染
 
 /**
- * 追加用户消息气泡（可选图片）
- * @param {string} text
- * @param {PromptImage[]} [images]
+ * 构建用户消息气泡 DOM
+ * @param {{ text?: string, images?: PromptImage[], imageCount?: number }} opts
+ * @returns {HTMLElement}
  */
-function appendUserBubble(text, images = []) {
+function createUserBubbleEl({ text = "", images = [], imageCount }) {
   const el = document.createElement("div");
   el.className = "msg msg-user";
 
@@ -754,9 +895,56 @@ function appendUserBubble(text, images = []) {
       imgsWrap.appendChild(imgEl);
     }
     el.appendChild(imgsWrap);
+  } else if (imageCount && imageCount > 0) {
+    const note = document.createElement("div");
+    note.className = "msg-image-note";
+    note.textContent = `📷 ${imageCount} 张图片（刷新前已发送）`;
+    el.appendChild(note);
   }
 
-  messagesEl.appendChild(el);
+  return el;
+}
+
+/**
+ * 构建思考块 DOM
+ * @param {{ streaming?: boolean, text?: string }} [opts]
+ * @returns {{ block: HTMLElement, header: HTMLElement, body: HTMLElement }}
+ */
+function createThoughtBlockEl({ streaming = false, text = "" } = {}) {
+  const block = document.createElement("div");
+  // 流式思考默认展开 — CSS 无 expanded 时 .thought-body 为 display:none
+  block.className = streaming ? "thought-block expanded" : "thought-block";
+
+  const header = document.createElement("div");
+  header.className = "thought-header";
+  const badgeClass = streaming ? "block-badge thinking" : "block-badge thought-done";
+  const badgeText = streaming ? "进行中" : "完成";
+  header.innerHTML =
+    `<span class="block-icon">💭</span><span class="block-title">思考过程</span><span class="${badgeClass}">${badgeText}</span>`;
+  header.addEventListener("click", () => {
+    // 用户手动切换后，finalize 不再自动改折叠态
+    block.dataset.userToggled = "1";
+    block.classList.toggle("expanded");
+    console.log("[app] 思考块手动切换 expanded=", block.classList.contains("expanded"));
+  });
+
+  const body = document.createElement("div");
+  body.className = "thought-body";
+  if (text) body.textContent = text;
+
+  block.appendChild(header);
+  block.appendChild(body);
+
+  return { block, header, body };
+}
+
+/**
+ * 追加用户消息气泡（可选图片）
+ * @param {string} text
+ * @param {PromptImage[]} [images]
+ */
+function appendUserBubble(text, images = []) {
+  messagesEl.appendChild(createUserBubbleEl({ text, images }));
   // 用户主动发消息，强制滚底以便看到刚发送的内容
   scrollToBottom({ force: true });
   // ponytail: localStorage 不存完整 base64，避免移动端配额爆掉；刷新后仅显示图片数量提示
@@ -781,7 +969,10 @@ function finalizeThoughtSegment() {
   );
   if (hasVisibleThoughtContent(thoughtText)) {
     if (currentThoughtBody) currentThoughtBody.textContent = thoughtText;
-    currentThoughtBlock.classList.add("expanded");
+    // 完成默认折叠；用户已手动切换则尊重其选择
+    if (!currentThoughtBlock.dataset.userToggled) {
+      currentThoughtBlock.classList.remove("expanded");
+    }
     saveHistory({ role: "thought", text: thoughtText });
     const badge = currentThoughtHeader?.querySelector(".block-badge");
     if (badge) {
@@ -835,23 +1026,10 @@ function finalizeCurrentStreamSegment() {
  * 创建新的思考块 DOM 并挂到当前轮次
  */
 function createThoughtBlockElement() {
-  currentThoughtBlock = document.createElement("div");
-  // 流式思考默认展开 — CSS 无 expanded 时 .thought-body 为 display:none，会只剩紫色 header 条
-  currentThoughtBlock.className = "thought-block expanded";
-
-  currentThoughtHeader = document.createElement("div");
-  currentThoughtHeader.className = "thought-header";
-  currentThoughtHeader.innerHTML =
-    '<span class="block-icon">💭</span><span class="block-title">思考过程</span><span class="block-badge thinking">进行中</span>';
-  currentThoughtHeader.addEventListener("click", () => {
-    currentThoughtBlock?.classList.toggle("expanded");
-  });
-
-  currentThoughtBody = document.createElement("div");
-  currentThoughtBody.className = "thought-body";
-
-  currentThoughtBlock.appendChild(currentThoughtHeader);
-  currentThoughtBlock.appendChild(currentThoughtBody);
+  const created = createThoughtBlockEl({ streaming: true });
+  currentThoughtBlock = created.block;
+  currentThoughtHeader = created.header;
+  currentThoughtBody = created.body;
   currentTurnEl?.appendChild(currentThoughtBlock);
 }
 
@@ -904,7 +1082,6 @@ function resetTurnStreamingState() {
   thoughtRawBuffer = "";
   toolBlocksMap.clear();
   toolSignatureMap.clear();
-  toolBlockOrder.length = 0;
   savedToolIds.clear();
   console.log("[app] 重置轮次流式状态");
 }
@@ -991,6 +1168,17 @@ function toolKindLabel(kind) {
     mcp: "MCP",
   };
   return kind ? (map[kind] ?? kind) : "工具";
+}
+
+/**
+ * 工具块 header 显示名（中文类型标签）
+ * @param {ToolUpdateData} data
+ * @returns {string}
+ */
+function toolHeaderName(data) {
+  if (data.kind) return toolKindLabel(data.kind);
+  if (data.toolName) return data.toolName;
+  return "工具";
 }
 
 /**
@@ -1150,7 +1338,7 @@ function getToolStartLine(data) {
  */
 function inferStartLineFromEmbeddedText(text) {
   if (!text) return null;
-  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+  for (const line of normalizeLines(text)) {
     const m = line.match(/^(\d+)\|(.*)$/);
     if (m) return Number(m[1]);
   }
@@ -1177,7 +1365,7 @@ function formatLineRange(startLine, lineCount) {
  */
 function prefixLineNumbers(text, startLine = 1) {
   if (!text) return "";
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const lines = normalizeLines(text);
   const endLine = startLine + lines.length - 1;
   const width = Math.max(String(endLine).length, 3);
   return lines
@@ -1193,7 +1381,7 @@ function prefixLineNumbers(text, startLine = 1) {
  */
 function formatTextWithLineNumbers(text, startLine = 1) {
   if (!text) return "";
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const lines = normalizeLines(text);
   /** @type {Array<{ lineNum: number, content: string }>} */
   const rows = [];
   let nextLine = startLine;
@@ -1487,10 +1675,7 @@ function aggregateToolStatus(parts) {
  * @returns {number}
  */
 function countTextLines(text) {
-  if (!text) return 0;
-  const normalized = text.replace(/\r\n/g, "\n");
-  if (!normalized) return 0;
-  return normalized.split("\n").length;
+  return normalizeLines(text).length;
 }
 
 /**
@@ -1500,8 +1685,8 @@ function countTextLines(text) {
  * @returns {number}
  */
 function countDiffAffectedLines(oldText, newText) {
-  const oldLines = oldText ? oldText.replace(/\r\n/g, "\n").split("\n") : [];
-  const newLines = newText ? newText.replace(/\r\n/g, "\n").split("\n") : [];
+  const oldLines = oldText ? normalizeLines(oldText) : [];
+  const newLines = newText ? normalizeLines(newText) : [];
   if (oldLines.length === 0 && newLines.length === 0) return 0;
   if (oldLines.length === 0) return newLines.length;
   if (newLines.length === 0) return oldLines.length;
@@ -1635,155 +1820,6 @@ function extractToolFilePath(data) {
 }
 
 /**
- * 工具块标题（优先显示文件名）
- * @param {ToolUpdateData} data
- * @param {ToolUpdateData[]} mergedParts
- * @returns {string}
- */
-function resolveToolDisplayTitle(data, mergedParts) {
-  const parts = mergedParts.length > 0 ? mergedParts : [data];
-  const primary = parts[0];
-  const filePath =
-    extractToolFilePath(primary) || parts.map((p) => extractToolFilePath(p)).find((p) => p) || "";
-  const action = toolLineActionLabel(primary.kind, primary.toolName);
-  const toolName = primary.toolName ?? "工具";
-
-  if (filePath) {
-    const short = shortenToolPath(filePath);
-    if (primary.toolName === "Read" || primary.kind === "read") return `读取 ${short}`;
-    if (primary.toolName === "Write" || primary.kind === "write") return `写入 ${short}`;
-    if (primary.toolName === "StrReplace" || primary.kind === "edit") return `编辑 ${short}`;
-    return `${action} ${short}`;
-  }
-
-  if (primary.title && !GENERIC_TOOL_TITLES.has(primary.title)) return primary.title;
-  return toolName;
-}
-
-/**
- * 行数摘要动词（按工具类型）
- * @param {string | undefined} kind
- * @param {string | undefined} toolName
- * @returns {string}
- */
-function toolLineActionLabel(kind, toolName) {
-  const name = toolName ?? "";
-  if (kind === "read" || name === "Read") return "读取";
-  if (kind === "write" || name === "Write") return "写入";
-  if (kind === "edit" || name === "StrReplace" || name === "Edit") return "变更";
-  if (kind === "search" || name === "Grep" || name === "SemanticSearch") return "匹配";
-  if (kind === "execute" || name === "Shell") return "输出";
-  if (kind === "list" || name === "Glob" || name === "LS") return "列出";
-  return "约";
-}
-
-/**
- * @typedef {{ lineCount: number, filePath: string, action: string, pending: boolean }} ToolPartSummary
- */
-
-/**
- * 单条工具调用的行数/路径摘要
- * @param {ToolUpdateData} data
- * @returns {ToolPartSummary}
- */
-function summarizeToolPart(data) {
-  let lineCount = 0;
-  let filePath = extractToolFilePath(data);
-  const action = toolLineActionLabel(data.kind, data.toolName);
-  const startLineHint = getToolStartLine(data);
-
-  const raw = data.rawInput;
-  if (raw && typeof raw === "object") {
-    const limit = parseToolNumericField(raw, ["limit"]);
-    if (limit != null && limit > 0) lineCount = Math.max(lineCount, limit);
-    if (typeof raw.new_string === "string" && raw.new_string) {
-      lineCount = Math.max(
-        lineCount,
-        countDiffAffectedLines(typeof raw.old_string === "string" ? raw.old_string : "", raw.new_string)
-      );
-    } else if (typeof raw.old_string === "string" && raw.old_string) {
-      lineCount = Math.max(lineCount, countTextLines(raw.old_string));
-    }
-    if (typeof raw.contents === "string" && raw.contents) {
-      lineCount = Math.max(lineCount, countTextLines(raw.contents));
-    }
-  }
-
-  if (Array.isArray(data.content)) {
-    for (const item of data.content) {
-      if (!item || typeof item !== "object") continue;
-      const obj = /** @type {Record<string, unknown>} */ (item);
-      if (obj.type === "diff") {
-        if (typeof obj.path === "string" && obj.path) filePath = filePath || obj.path;
-        const oldT = typeof obj.oldText === "string" ? obj.oldText : "";
-        const newT = typeof obj.newText === "string" ? obj.newText : "";
-        lineCount += countDiffAffectedLines(oldT, newT);
-      } else if (obj.type === "content") {
-        const text = extractContentBlockText(obj.content);
-        if (text) lineCount = Math.max(lineCount, countTextLines(text));
-      }
-    }
-  }
-
-  const out = /** @type {Record<string, unknown> | undefined} */ (data.rawOutput);
-  if (out) {
-    const stdout = typeof out.stdout === "string" ? out.stdout : "";
-    const stderr = typeof out.stderr === "string" ? out.stderr : "";
-    const outContent = typeof out.content === "string" ? out.content : "";
-    const combined = stdout || stderr || outContent;
-    if (combined) lineCount = Math.max(lineCount, countTextLines(combined));
-  }
-
-  if (lineCount === 0 && startLineHint > 1) lineCount = 1;
-
-  const pending = !data.status || data.status === "pending" || data.status === "in_progress";
-  return { lineCount, filePath, action, pending };
-}
-
-/**
- * 工具块折叠态一行摘要（行数 + 路径/命令）
- * @param {ToolUpdateData} data
- * @param {ToolUpdateData[]} mergedParts
- * @returns {string}
- */
-function formatToolSummary(data, mergedParts) {
-  const parts = mergedParts.length > 0 ? mergedParts : [data];
-
-  if (parts.length > 1) {
-    const summaries = parts.map(summarizeToolPart);
-    const totalLines = summaries.reduce((sum, s) => sum + s.lineCount, 0);
-    const anyPending = summaries.some((s) => s.pending);
-    if (anyPending && totalLines === 0) return `共 ${parts.length} 次相同调用 · 执行中…`;
-    return totalLines > 0
-      ? `共 ${parts.length} 次相同调用 · 约 ${totalLines} 行`
-      : `共 ${parts.length} 次相同调用 · 点击查看详情`;
-  }
-
-  const primary = parts[0];
-  const s = summarizeToolPart(primary);
-  const chunks = [];
-
-  if (s.pending && s.lineCount === 0) {
-    chunks.push("执行中…");
-  } else if (s.lineCount > 0) {
-    const range = formatLineRange(getToolStartLine(primary), s.lineCount);
-    chunks.push(`${s.action} ${s.lineCount} 行 (${range})`);
-  }
-
-  if (s.filePath) {
-    chunks.push(s.filePath.includes("/") || s.filePath.includes("\\") ? shortenToolPath(s.filePath) : s.filePath);
-  } else if (primary.rawInput && typeof primary.rawInput.command === "string") {
-    const cmdLine = primary.rawInput.command.trim().split(/\r?\n/)[0];
-    if (cmdLine) chunks.push(cmdLine.length > 40 ? `${cmdLine.slice(0, 40)}…` : cmdLine);
-  }
-
-  if (chunks.length === 0) {
-    return primary.title ?? "点击查看详情";
-  }
-  return chunks.join(" · ");
-}
-
-/**
  * @typedef {{ path?: string, oldText: string, newText: string, startLine: number }} ToolDiffBlock
  */
 
@@ -1843,8 +1879,8 @@ function collectToolDiffBlocks(data) {
  * @returns {Array<{ kind: "del" | "add", lineNum: number, text: string }>}
  */
 function buildDiffDisplayRows(oldText, newText, startLine = 1) {
-  const oldLines = oldText ? oldText.replace(/\r\n/g, "\n").split("\n") : [];
-  const newLines = newText ? newText.replace(/\r\n/g, "\n").split("\n") : [];
+  const oldLines = oldText ? normalizeLines(oldText) : [];
+  const newLines = newText ? normalizeLines(newText) : [];
   /** @type {Array<{ kind: "del" | "add", lineNum: number, text: string }>} */
   const rows = [];
   for (let i = 0; i < oldLines.length; i++) {
@@ -1889,29 +1925,11 @@ function renderToolDiffHtml(oldText, newText, startLine = 1) {
 }
 
 /**
- * 工具块元信息（不含 diff 代码正文）
+ * 追加工具位置行
+ * @param {string[]} lines
  * @param {ToolUpdateData} data
- * @returns {string}
  */
-function formatToolBodyMeta(data) {
-  const startLine = getToolStartLine(data);
-  const filePath = extractToolFilePath(data);
-  const lines = [];
-
-  if (filePath) lines.push(`文件: ${filePath}`);
-  if (data.toolName) lines.push(`工具: ${data.toolName}`);
-  if (data.kind) lines.push(`类型: ${toolKindLabel(data.kind)}`);
-
-  const inputText = formatToolRawInput(data.rawInput, { skipCodeFields: true });
-  if (inputText) lines.push(inputText);
-
-  const raw = data.rawInput;
-  if (raw && typeof raw === "object") {
-    if (typeof raw.command === "string" && raw.command.includes("\n")) {
-      lines.push(`命令:\n${formatTextWithLineNumbers(raw.command, 1)}`);
-    }
-  }
-
+function appendToolLocationLines(lines, data) {
   if (Array.isArray(data.locations) && data.locations.length > 0) {
     const locText = data.locations
       .map((loc) => {
@@ -1922,19 +1940,29 @@ function formatToolBodyMeta(data) {
       .join("\n");
     if (locText) lines.push(`位置:\n${locText}`);
   }
+}
 
-  if (Array.isArray(data.content) && data.content.length > 0) {
-    const consolidated = consolidateToolContentItems(data.content);
-    const nonDiffText = consolidated
-      .filter((item) => {
-        if (!item || typeof item !== "object") return false;
-        return /** @type {Record<string, unknown>} */ (item).type !== "diff";
-      })
-      .map((item) => formatToolCallContentItem(item, startLine))
-      .filter(Boolean)
-      .join("\n\n");
-    if (nonDiffText) lines.push(`内容:\n${nonDiffText}`);
-  }
+/**
+ * 构建工具块公共元信息行（file/tool/kind/input + 可选中间段 + locations/output/title）
+ * @param {ToolUpdateData} data
+ * @param {{ beforeLocations?: (lines: string[], data: ToolUpdateData) => void, afterLocations?: (lines: string[], data: ToolUpdateData) => void }} [hooks]
+ * @returns {string[]}
+ */
+function buildToolMetaLines(data, hooks = {}) {
+  const filePath = extractToolFilePath(data);
+  /** @type {string[]} */
+  const lines = [];
+
+  if (filePath) lines.push(`文件: ${filePath}`);
+  if (data.toolName) lines.push(`工具: ${data.toolName}`);
+  if (data.kind) lines.push(`类型: ${toolKindLabel(data.kind)}`);
+
+  const inputText = formatToolRawInput(data.rawInput, { skipCodeFields: true });
+  if (inputText) lines.push(inputText);
+
+  if (hooks.beforeLocations) hooks.beforeLocations(lines, data);
+  appendToolLocationLines(lines, data);
+  if (hooks.afterLocations) hooks.afterLocations(lines, data);
 
   const outputText = formatToolRawOutput(
     /** @type {Record<string, unknown> | undefined} */ (data.rawOutput)
@@ -1945,6 +1973,39 @@ function formatToolBodyMeta(data) {
     lines.push(`说明: ${data.title}`);
   }
 
+  return lines;
+}
+
+/**
+ * 工具块元信息（不含 diff 代码正文）
+ * @param {ToolUpdateData} data
+ * @returns {string}
+ */
+function formatToolBodyMeta(data) {
+  const startLine = getToolStartLine(data);
+  const lines = buildToolMetaLines(data, {
+    beforeLocations: (lines, toolData) => {
+      const raw = toolData.rawInput;
+      if (raw && typeof raw === "object") {
+        if (typeof raw.command === "string" && raw.command.includes("\n")) {
+          lines.push(`命令:\n${formatTextWithLineNumbers(raw.command, 1)}`);
+        }
+      }
+    },
+    afterLocations: (lines, toolData) => {
+      if (!Array.isArray(toolData.content) || toolData.content.length === 0) return;
+      const consolidated = consolidateToolContentItems(toolData.content);
+      const nonDiffText = consolidated
+        .filter((item) => {
+          if (!item || typeof item !== "object") return false;
+          return /** @type {Record<string, unknown>} */ (item).type !== "diff";
+        })
+        .map((item) => formatToolCallContentItem(item, startLine))
+        .filter(Boolean)
+        .join("\n\n");
+      if (nonDiffText) lines.push(`内容:\n${nonDiffText}`);
+    },
+  });
   return lines.join("\n\n");
 }
 
@@ -2003,70 +2064,43 @@ function formatToolBody(data, mergedParts = []) {
 
   const primary = mergedParts.length === 1 ? mergedParts[0] : data;
   const startLine = getToolStartLine(primary);
-  const filePath = extractToolFilePath(primary);
-  const lines = [];
-
-  if (filePath) lines.push(`文件: ${filePath}`);
-
-  if (primary.toolName) lines.push(`工具: ${primary.toolName}`);
-  if (primary.kind) lines.push(`类型: ${toolKindLabel(primary.kind)}`);
-
-  const inputText = formatToolRawInput(primary.rawInput, { skipCodeFields: true });
-  if (inputText) lines.push(inputText);
-
-  const raw = primary.rawInput;
   const hasContentDiff =
     Array.isArray(primary.content) &&
     primary.content.some(
       (item) => item && typeof item === "object" && /** @type {Record<string, unknown>} */ (item).type === "diff"
     );
 
-  if (raw && typeof raw === "object" && !hasContentDiff) {
-    const oldStr = typeof raw.old_string === "string" ? raw.old_string : "";
-    const newStr = typeof raw.new_string === "string" ? raw.new_string : "";
-    if (newStr) {
-      if (oldStr) {
-        lines.push(`--- 删除 ---\n${formatTextWithLineNumbers(oldStr, startLine)}`);
-        lines.push(`+++ 新增 ---\n${formatTextWithLineNumbers(newStr, startLine)}`);
-      } else {
-        lines.push(`变更内容:\n${formatTextWithLineNumbers(newStr, startLine)}`);
+  const lines = buildToolMetaLines(primary, {
+    beforeLocations: (lines, toolData) => {
+      const raw = toolData.rawInput;
+      if (raw && typeof raw === "object" && !hasContentDiff) {
+        const oldStr = typeof raw.old_string === "string" ? raw.old_string : "";
+        const newStr = typeof raw.new_string === "string" ? raw.new_string : "";
+        if (newStr) {
+          if (oldStr) {
+            lines.push(`--- 删除 ---\n${formatTextWithLineNumbers(oldStr, startLine)}`);
+            lines.push(`+++ 新增 ---\n${formatTextWithLineNumbers(newStr, startLine)}`);
+          } else {
+            lines.push(`变更内容:\n${formatTextWithLineNumbers(newStr, startLine)}`);
+          }
+        } else if (oldStr) {
+          lines.push(`原内容:\n${formatTextWithLineNumbers(oldStr, startLine)}`);
+        }
+        if (typeof raw.command === "string" && raw.command.includes("\n")) {
+          lines.push(`命令:\n${formatTextWithLineNumbers(raw.command, 1)}`);
+        }
       }
-    } else if (oldStr) {
-      lines.push(`原内容:\n${formatTextWithLineNumbers(oldStr, startLine)}`);
-    }
-    if (typeof raw.command === "string" && raw.command.includes("\n")) {
-      lines.push(`命令:\n${formatTextWithLineNumbers(raw.command, 1)}`);
-    }
-  }
-
-  if (Array.isArray(primary.locations) && primary.locations.length > 0) {
-    const locText = primary.locations
-      .map((loc) => {
-        const p = loc.path ?? "";
-        return loc.line != null ? `${p}:${loc.line}` : p;
-      })
-      .filter(Boolean)
-      .join("\n");
-    if (locText) lines.push(`位置:\n${locText}`);
-  }
-
-  if (Array.isArray(primary.content) && primary.content.length > 0) {
-    const consolidated = consolidateToolContentItems(primary.content);
-    const contentText = consolidated
-      .map((item) => formatToolCallContentItem(item, startLine))
-      .filter(Boolean)
-      .join("\n\n");
-    if (contentText) lines.push(`内容:\n${contentText}`);
-  }
-
-  const outputText = formatToolRawOutput(
-    /** @type {Record<string, unknown> | undefined} */ (primary.rawOutput)
-  );
-  if (outputText) lines.push(outputText);
-
-  if (lines.length === 0 && primary.title) {
-    lines.push(`说明: ${primary.title}`);
-  }
+    },
+    afterLocations: (lines, toolData) => {
+      if (!Array.isArray(toolData.content) || toolData.content.length === 0) return;
+      const consolidated = consolidateToolContentItems(toolData.content);
+      const contentText = consolidated
+        .map((item) => formatToolCallContentItem(item, startLine))
+        .filter(Boolean)
+        .join("\n\n");
+      if (contentText) lines.push(`内容:\n${contentText}`);
+    },
+  });
 
   if (lines.length === 0) {
     return JSON.stringify(primary, null, 2);
@@ -2080,18 +2114,14 @@ function formatToolBody(data, mergedParts = []) {
  * @param {ToolBlockEntry} entry
  */
 function renderToolBlock(entry) {
-  const { header, statusEl, summaryEl, body, data, block, mergedParts, toolCallIds } = entry;
-  const baseTitle = resolveToolDisplayTitle(data, mergedParts);
-  const count = toolCallIds.size;
-  const title = count > 1 ? `${baseTitle} (×${count})` : baseTitle;
+  const { header, statusEl, body, data, block, mergedParts } = entry;
+  const primary = mergedParts.length > 0 ? mergedParts[0] : data;
   const titleEl = header.querySelector(".block-title");
-  if (titleEl) titleEl.textContent = title;
+  if (titleEl) titleEl.textContent = toolHeaderName(primary);
 
   const status = aggregateToolStatus(mergedParts.length > 0 ? mergedParts : [data]);
   statusEl.textContent = toolStatusLabel(status);
   statusEl.className = `block-badge tool-status-${status}`;
-
-  summaryEl.textContent = formatToolSummary(data, mergedParts);
 
   const diffHtml = renderToolBodyHtml(data, mergedParts);
   if (diffHtml) {
@@ -2101,6 +2131,11 @@ function renderToolBlock(entry) {
   } else {
     body.textContent = formatToolBody(data, mergedParts);
     body.classList.remove("tool-body-has-diff");
+  }
+
+  // 执行中展开、完成后折叠；用户手动切换后不再自动改
+  if (!entry.userToggled) {
+    block.classList.toggle("expanded", status === "pending" || status === "in_progress");
   }
 }
 
@@ -2115,34 +2150,38 @@ function createToolBlockEntry(data) {
 
   const header = document.createElement("div");
   header.className = "tool-header";
-  header.innerHTML = `<span class="block-icon">🔧</span><span class="block-title">${escapeHtml(data.title ?? "工具调用")}</span><span class="block-badge tool-status-pending">等待</span>`;
-  header.addEventListener("click", () => block.classList.toggle("expanded"));
+  header.innerHTML = `<span class="block-icon">🔧</span><span class="block-title">${escapeHtml(toolHeaderName(data))}</span><span class="block-badge tool-status-pending">等待</span>`;
 
   const statusEl = header.querySelector(".block-badge");
-  const summaryEl = document.createElement("div");
-  summaryEl.className = "tool-summary";
-  summaryEl.addEventListener("click", () => block.classList.toggle("expanded"));
 
   const body = document.createElement("div");
   body.className = "tool-body";
 
   block.appendChild(header);
-  block.appendChild(summaryEl);
   block.appendChild(body);
 
-  const toolCallId = data.toolCallId ?? `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const toolCallId = data.toolCallId ?? makeEphemeralId("tool");
   const normalized = { ...data, toolCallId };
 
-  return {
+  /** @type {ToolBlockEntry} */
+  const entry = {
     block,
     header: /** @type {HTMLElement} */ (header),
     statusEl: /** @type {HTMLElement} */ (statusEl),
-    summaryEl,
     body,
     data: normalized,
     toolCallIds: new Set([toolCallId]),
     mergedParts: [normalized],
+    userToggled: false,
   };
+
+  header.addEventListener("click", () => {
+    entry.userToggled = true;
+    block.classList.toggle("expanded");
+    console.log("[app] 工具块手动切换 expanded=", block.classList.contains("expanded"));
+  });
+
+  return entry;
 }
 
 /**
@@ -2155,7 +2194,7 @@ function appendToolBlock(update) {
 
   const incoming = /** @type {ToolUpdateData} */ (update ?? {});
   const toolCallId =
-    incoming.toolCallId ?? `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    incoming.toolCallId ?? makeEphemeralId("tool");
   const data = { ...incoming, toolCallId };
 
   let entry = toolBlocksMap.get(toolCallId);
@@ -2186,7 +2225,6 @@ function appendToolBlock(update) {
       } else {
         messagesEl.appendChild(entry.block);
       }
-      toolBlockOrder.push(entry);
       toolBlocksMap.set(toolCallId, entry);
       if (!isRestoringHistory) toolSignatureMap.set(signature, entry);
       console.log("[app] 创建工具块 toolCallId=", toolCallId, "signature=", signature);
@@ -2475,6 +2513,71 @@ function syncMessagesBottomPadding() {
   updateTurnNavButtons();
 }
 
+// #region 通用工具
+
+/**
+ * 统一换行符并按行拆分
+ * @param {string} text
+ * @returns {string[]}
+ */
+function normalizeLines(text) {
+  if (!text) return [];
+  return text.replace(/\r\n/g, "\n").split("\n");
+}
+
+/**
+ * 生成短时临时 ID
+ * @param {string} prefix
+ * @returns {string}
+ */
+function makeEphemeralId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+/**
+ * 从 data URL 提取 base64 载荷
+ * @param {string} dataUrl
+ * @returns {string}
+ */
+function dataUrlToBase64(dataUrl) {
+  return dataUrl.split(",")[1] ?? "";
+}
+
+/**
+ * 页面可见或网络恢复时：已连接则 hello，否则重连
+ */
+function reconnectOrHello() {
+  if (ws?.readyState === WebSocket.OPEN) {
+    sendHello();
+  } else {
+    connectWs();
+  }
+}
+
+/**
+ * 填充 select 选项
+ * @template T
+ * @param {HTMLSelectElement} el
+ * @param {T[]} items
+ * @param {(item: T) => string} getValue
+ * @param {(item: T) => string} getLabel
+ * @param {string | undefined} [currentValue]
+ */
+function fillSelect(el, items, getValue, getLabel, currentValue) {
+  el.innerHTML = "";
+  for (const item of items) {
+    const opt = document.createElement("option");
+    opt.value = getValue(item);
+    opt.textContent = getLabel(item);
+    el.appendChild(opt);
+  }
+  if (currentValue) el.value = currentValue;
+}
+
+// #endregion
+
+// #region 文本工具
+
 /**
  * HTML 转义
  * @param {string} str
@@ -2712,14 +2815,6 @@ function scheduleFileExplorerRefresh() {
     fileExplorerRefreshTimer = null;
     refreshFileExplorerListing();
   }, 250);
-}
-
-/**
- * 若文件浏览器可见则刷新当前目录（带加载态，用于打开/切换目录）
- */
-function refreshFileExplorerIfVisible() {
-  if (!isFileExplorerVisible()) return;
-  loadFileExplorer(fileExplorerCurrentPath || undefined);
 }
 
 /**
@@ -2970,7 +3065,6 @@ function fileExplorerUp() {
  */
 function showAskModal(msg) {
   pendingAskId = /** @type {number} */ (msg.id);
-  askSelections = {};
 
   askTitle.textContent = msg.title ? String(msg.title) : "请选择";
   askQuestions.innerHTML = "";
@@ -3115,7 +3209,7 @@ async function processImageFile(file) {
   // HEIC/HEIF 浏览器无法 canvas 解码，原样 base64 发送
   if (mimeHint === "image/heic" || mimeHint === "image/heif") {
     const dataUrl = await readFileAsDataUrl(file);
-    const base64 = dataUrl.split(",")[1] ?? "";
+    const base64 = dataUrlToBase64(dataUrl);
     if (!base64) throw new Error(`图片 ${file.name} 编码失败`);
     return { mimeType: mimeHint, data: base64, previewUrl: dataUrl };
   }
@@ -3123,7 +3217,7 @@ async function processImageFile(file) {
   // GIF 不做重编码，避免丢失动画
   if (mimeHint === "image/gif") {
     const dataUrl = await readFileAsDataUrl(file);
-    const base64 = dataUrl.split(",")[1] ?? "";
+    const base64 = dataUrlToBase64(dataUrl);
     if (!base64) throw new Error(`图片 ${file.name} 编码失败`);
     return { mimeType: "image/gif", data: base64, previewUrl: dataUrl };
   }
@@ -3151,7 +3245,7 @@ async function processImageFile(file) {
   const outputMime = mimeHint === "image/png" ? "image/png" : "image/jpeg";
   const quality = outputMime === "image/jpeg" ? 0.85 : undefined;
   const outDataUrl = canvas.toDataURL(outputMime, quality);
-  const base64 = outDataUrl.split(",")[1] ?? "";
+  const base64 = dataUrlToBase64(outDataUrl);
   if (!base64) throw new Error(`图片 ${file.name} 压缩失败`);
 
   console.log("[app] 图片就绪 mime=", outputMime, "base64Len=", base64.length);
@@ -3224,7 +3318,7 @@ async function handleImageFilesSelected(fileList) {
     try {
       const processed = await processImageFile(file);
       pendingImages.push({
-        id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        id: makeEphemeralId("img"),
         mimeType: processed.mimeType,
         data: processed.data,
         previewUrl: processed.previewUrl,
@@ -3316,17 +3410,7 @@ function loadHistory() {
 function appendRestoredThoughtBlock(rawText, parentEl = messagesEl) {
   const thoughtText = normalizeThoughtText(rawText ?? "");
   if (!hasVisibleThoughtContent(thoughtText)) return;
-  const block = document.createElement("div");
-  block.className = "thought-block";
-  const header = document.createElement("div");
-  header.className = "thought-header";
-  header.innerHTML = '<span class="block-icon">💭</span><span class="block-title">思考过程</span><span class="block-badge thought-done">完成</span>';
-  header.addEventListener("click", () => block.classList.toggle("expanded"));
-  const body = document.createElement("div");
-  body.className = "thought-body";
-  body.textContent = thoughtText;
-  block.appendChild(header);
-  block.appendChild(body);
+  const { block } = createThoughtBlockEl({ streaming: false, text: thoughtText });
   parentEl.appendChild(block);
 }
 
@@ -3379,36 +3463,13 @@ function restoreHistory() {
   while (i < history.length) {
     const entry = history[i];
     if (entry.role === "user") {
-      const el = document.createElement("div");
-      el.className = "msg msg-user";
-
-      if (entry.text) {
-        const textEl = document.createElement("div");
-        textEl.className = "msg-text";
-        textEl.textContent = entry.text;
-        el.appendChild(textEl);
-      }
-
-      const images = entry.images ?? [];
-      if (images.length > 0) {
-        const imgsWrap = document.createElement("div");
-        imgsWrap.className = "msg-images";
-        for (const img of images) {
-          const imgEl = document.createElement("img");
-          imgEl.src = `data:${img.mimeType};base64,${img.data}`;
-          imgEl.alt = "用户图片";
-          imgEl.loading = "lazy";
-          imgsWrap.appendChild(imgEl);
-        }
-        el.appendChild(imgsWrap);
-      } else if (entry.imageCount && entry.imageCount > 0) {
-        const note = document.createElement("div");
-        note.className = "msg-image-note";
-        note.textContent = `📷 ${entry.imageCount} 张图片（刷新前已发送）`;
-        el.appendChild(note);
-      }
-
-      messagesEl.appendChild(el);
+      messagesEl.appendChild(
+        createUserBubbleEl({
+          text: entry.text,
+          images: entry.images ?? [],
+          imageCount: entry.imageCount,
+        })
+      );
       i++;
 
       /** @type {HistoryEntry[]} */
@@ -3708,8 +3769,9 @@ console.assert(
   "[app] isFilesystemMutatingTool 自检失败"
 );
 console.assert(
-  formatToolSummary({ kind: "read", rawOutput: { stdout: "line1\nline2\nline3" } }, []).includes("3 行"),
-  "[app] formatToolSummary 自检失败"
+  toolHeaderName({ kind: "read" }) === "读文件" &&
+    toolHeaderName({ toolName: "Shell" }) === "Shell",
+  "[app] toolHeaderName 自检失败"
 );
 console.assert(
   prefixLineNumbers("a\nb", 10).startsWith(" 10 │"),
@@ -3726,10 +3788,6 @@ console.assert(
   "[app] extractToolFilePath rawInput 自检失败"
 );
 console.assert(
-  resolveToolDisplayTitle({ toolName: "Read", rawInput: { path: "/a/b.ts" } }, []) === "读取 b.ts",
-  "[app] resolveToolDisplayTitle 自检失败"
-);
-console.assert(
   [{ role: "thought" }, { role: "agent" }, { role: "tool" }, { role: "agent" }].map((e) => e.role).join(",") ===
     "thought,agent,tool,agent",
   "[app] 轮次块顺序自检失败"
@@ -3744,6 +3802,19 @@ window.addEventListener("resize", () => {
   syncFileExplorerLayout();
 });
 WIDE_LAYOUT_MQ.addEventListener("change", syncFileExplorerLayout);
+
+// ponytail: 移动端锁屏/切网恢复后立即 hello 或重连，减少漏事件窗口
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  console.log("[app] 页面可见，检查 WS 连接");
+  reconnectOrHello();
+});
+
+window.addEventListener("online", () => {
+  console.log("[app] 网络恢复");
+  reconnectOrHello();
+});
+
 console.log("[app] Cursor 移动桥接前端已加载");
 
 // #endregion

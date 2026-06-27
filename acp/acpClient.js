@@ -6,6 +6,8 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,6 +27,36 @@ const PROTOCOL_VERSION = 1;
 
 /** 日志前缀，便于 grep */
 const LOG_PREFIX = "[acpClient]";
+
+/**
+ * 解析 agent 可执行文件（跨平台）
+ * 优先级: 构造参数 / AGENT_COMMAND 环境变量 > 平台默认 > ~/.local/bin
+ * @param {string | undefined} override
+ * @returns {string}
+ */
+function resolveAgentCommand(override) {
+  const fromEnv = override ?? process.env.AGENT_COMMAND;
+  if (fromEnv?.trim()) {
+    return fromEnv.trim();
+  }
+
+  if (process.platform === "win32") {
+    return "agent.cmd";
+  }
+
+  // macOS / Linux：官方 curl 安装到 ~/.local/bin/agent
+  const localAgent = path.join(os.homedir(), ".local", "bin", "agent");
+  const localCursorAgent = path.join(os.homedir(), ".local", "bin", "cursor-agent");
+
+  if (fs.existsSync(localAgent)) {
+    return localAgent;
+  }
+  if (fs.existsSync(localCursorAgent)) {
+    return localCursorAgent;
+  }
+
+  return "agent";
+}
 
 /**
  * Cursor Agent ACP 客户端
@@ -77,13 +109,13 @@ export class AcpClient extends EventEmitter {
   /**
    * @param {object} [options]
    * @param {string} [options.workspaceDir] agent cwd，默认 ./workspace
-   * @param {string} [options.agentCommand] agent 可执行文件，默认 agent.cmd (Windows)
+   * @param {string} [options.agentCommand] agent 可执行文件；默认按平台解析（Win: agent.cmd，Mac/Linux: agent）
    */
   constructor(options = {}) {
     super();
     this.workspaceDir = options.workspaceDir ?? WORKSPACE_DIR;
-    this.agentCommand = options.agentCommand ?? "agent.cmd";
-    console.log(`${LOG_PREFIX} 构造完成，workspace=${this.workspaceDir}`);
+    this.agentCommand = resolveAgentCommand(options.agentCommand);
+    console.log(`${LOG_PREFIX} 构造完成，workspace=${this.workspaceDir} agent=${this.agentCommand}`);
   }
 
   /** @returns {boolean} 是否已启动 */
@@ -128,9 +160,11 @@ export class AcpClient extends EventEmitter {
 
     console.log(`${LOG_PREFIX} 启动 agent acp，cwd=${this.workspaceDir}`);
 
+    // ponytail: Windows 的 .cmd 需 shell；Unix 直 exec 避免 DEP0190
+    const spawnShell = process.platform === "win32";
     this.#agentProcess = spawn(this.agentCommand, ["acp"], {
       stdio: ["pipe", "pipe", "inherit"],
-      shell: true,
+      shell: spawnShell,
       cwd: this.workspaceDir,
     });
 
@@ -139,6 +173,14 @@ export class AcpClient extends EventEmitter {
 
     this.#agentProcess.on("error", (err) => {
       console.error(`${LOG_PREFIX} 子进程错误:`, err.message);
+      if (err.code === "ENOENT") {
+        console.error(
+          `${LOG_PREFIX} 未找到 agent CLI。` +
+            (process.platform === "win32"
+              ? " 请确认 agent.cmd 在 PATH 中（默认: %LOCALAPPDATA%\\cursor-agent\\）。"
+              : " 请运行: curl https://cursor.com/install -fsSL | bash && agent login")
+        );
+      }
       this.emit("error", { message: err.message });
     });
 

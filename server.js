@@ -10,6 +10,13 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { AcpClient, WORKSPACE_DIR } from "./acp/acpClient.js";
+import {
+  canReplayIncremental,
+  buildReplay,
+  buildCurrentTurnEvents,
+  latestSeq,
+  appendEventToLog,
+} from "./acp/eventLog.js";
 import { enrichToolUpdate, hasToolRawInput } from "./acp/toolEnricher.js";
 import { browseDirectory, resolveDirPath, formatPathForDisplay, listWorkspaceContents, readWorkspaceFile } from "./fs/dirBrowser.js";
 
@@ -31,8 +38,17 @@ let promptInFlight = false;
 /** @type {boolean} 是否正在切换工作空间 */
 let workspaceSwitchInFlight = false;
 
-/** @type {Array<Record<string, unknown>>} 当前轮次事件缓冲（重连时回放） */
-let turnEventBuffer = [];
+/** @type {number} 下一条事件 seq（单调递增，epoch 切换时不重置） */
+let nextSeq = 1;
+
+/** @type {number} 进程/会话 epoch（new_session / set_workspace 时自增） */
+let epoch = Date.now();
+
+/** @type {Array<Record<string, unknown>>} 跨轮次环形事件日志（增量 replay） */
+let eventLog = [];
+
+/** @type {number} 当前轮 user_message 的 seq（全量 sync 切片起点） */
+let lastUserSeq = 0;
 
 /** @type {number | null} 当前轮次开始时间戳（ms） */
 let turnStartedAt = null;
@@ -40,21 +56,8 @@ let turnStartedAt = null;
 /** @type {Record<string, unknown> | null} 挂起的 ask_question */
 let pendingAskQuestion = null;
 
-/** 需写入轮次缓冲的消息类型 */
-const TURN_EVENT_TYPES = new Set([
-  "user_message",
-  "thought",
-  "message",
-  "tool",
-  "plan",
-  "todos",
-  "task",
-  "generate_image",
-  "done",
-  "error",
-  "cancelled",
-  "ask_question",
-]);
+/** WS 心跳间隔（ms） */
+const WS_HEARTBEAT_MS = 15_000;
 
 /** 单张图片 base64 最大字节数（约 4MB） */
 const MAX_IMAGE_BASE64_LEN = 4 * 1024 * 1024;
@@ -140,85 +143,95 @@ function buildInitPayload() {
  */
 function buildSyncPayload() {
   const base = buildInitPayload();
+  const turnEvents = buildCurrentTurnEvents(eventLog, lastUserSeq);
   return {
     ...base,
     type: "sync",
+    epoch,
+    seq: latestSeq(eventLog),
     promptInFlight,
     turnStartedAt: promptInFlight ? turnStartedAt : null,
-    turnEvents: [...turnEventBuffer],
+    turnEvents,
     pendingAsk: pendingAskQuestion,
     workspaceSwitchInFlight,
   };
 }
 
 /**
- * 记录轮次事件（供 WS 断线重连后回放）
+ * 构建增量 replay 消息 — seq > fromSeq 的事件 + 状态元数据
+ * @param {number} fromSeq
+ * @returns {Record<string, unknown>}
+ */
+function buildReplayPayload(fromSeq) {
+  const events = buildReplay(eventLog, fromSeq);
+  return {
+    ...buildInitPayload(),
+    type: "replay",
+    epoch,
+    seq: latestSeq(eventLog),
+    events,
+    promptInFlight,
+    turnStartedAt: promptInFlight ? turnStartedAt : null,
+    pendingAsk: pendingAskQuestion,
+    workspaceSwitchInFlight,
+  };
+}
+
+/**
+ * 重置事件日志（new_session / set_workspace 时 epoch 自增）
+ */
+function resetEventLog() {
+  epoch = Date.now();
+  eventLog = [];
+  lastUserSeq = 0;
+  turnStartedAt = null;
+  pendingAskQuestion = null;
+  console.log(`${LOG_PREFIX} eventLog 已重置 epoch=${epoch} nextSeq=${nextSeq}`);
+}
+
+/**
+ * 分配 seq 并写入环形事件日志
+ * @param {Record<string, unknown>} msg
+ * @returns {Record<string, unknown> | null} 带 seq/epoch 的事件副本，非轮次事件返回 null
+ */
+function appendEvent(msg) {
+  const result = appendEventToLog(
+    { nextSeq, epoch, eventLog, lastUserSeq, turnStartedAt, pendingAskQuestion },
+    msg
+  );
+  nextSeq = result.state.nextSeq;
+  eventLog = result.state.eventLog;
+  lastUserSeq = result.state.lastUserSeq;
+  turnStartedAt = result.state.turnStartedAt;
+  pendingAskQuestion = result.state.pendingAskQuestion;
+  return result.event;
+}
+
+/**
+ * 处理客户端 hello — 决定增量 replay 或全量 sync，然后加入广播组
+ * @param {WebSocket} ws
  * @param {Record<string, unknown>} msg
  */
-function recordTurnEvent(msg) {
-  const type = String(msg.type ?? "");
-  if (!TURN_EVENT_TYPES.has(type)) return;
+function handleClientHello(ws, msg) {
+  const clientEpoch = typeof msg.epoch === "number" ? msg.epoch : null;
+  const clientLastSeq = typeof msg.lastSeq === "number" ? msg.lastSeq : 0;
 
-  /** @type {Record<string, unknown>} */
-  const copy = JSON.parse(JSON.stringify(msg));
-
-  if (type === "user_message") {
-    turnEventBuffer = [copy];
-    turnStartedAt = Date.now();
-    pendingAskQuestion = null;
-    console.log(`${LOG_PREFIX} 轮次缓冲: 新 user_message`);
-    return;
+  if (canReplayIncremental(eventLog, clientEpoch, epoch, clientLastSeq)) {
+    const payload = buildReplayPayload(clientLastSeq);
+    sendTo(ws, payload);
+    console.log(
+      `${LOG_PREFIX} replay 已下发 fromSeq=${clientLastSeq} events=${Array.isArray(payload.events) ? payload.events.length : 0}`
+    );
+  } else {
+    sendTo(ws, buildSyncPayload());
+    const reason =
+      clientEpoch !== epoch ? "epoch_mismatch" : clientLastSeq <= 0 ? "fresh" : "buffer_too_old";
+    console.log(`${LOG_PREFIX} sync 已下发 (hello) reason=${reason} lastSeq=${clientLastSeq}`);
   }
 
-  if (turnEventBuffer.length === 0) return;
-
-  // ponytail: 连续 thought chunk 合并为一条，减小 sync 快照体积
-  if (type === "thought") {
-    const text = String(copy.text ?? "");
-    if (!text) return;
-    const last = turnEventBuffer[turnEventBuffer.length - 1];
-    if (last?.type === "thought") {
-      last.text = String(last.text ?? "") + text;
-      console.log(`${LOG_PREFIX} 轮次缓冲: 合并 thought chunk +${text.length}`);
-      return;
-    }
-    turnEventBuffer.push({ type: "thought", text });
-    return;
-  }
-
-  // ponytail: 同一 toolCallId 的补全更新覆盖缓冲中的旧条目，避免重连后重复渲染
-  if (type === "tool") {
-    const update = /** @type {{ toolCallId?: string }} */ (copy.update ?? {});
-    const toolCallId = update.toolCallId;
-    if (toolCallId) {
-      for (let i = turnEventBuffer.length - 1; i >= 0; i--) {
-        const entry = turnEventBuffer[i];
-        if (entry.type !== "tool") continue;
-        const prevUpdate = /** @type {{ toolCallId?: string }} */ (entry.update ?? {});
-        if (prevUpdate.toolCallId === toolCallId) {
-          turnEventBuffer[i] = copy;
-          console.log(`${LOG_PREFIX} 轮次缓冲: 更新 tool toolCallId=${toolCallId}`);
-          return;
-        }
-      }
-    }
-  }
-
-  turnEventBuffer.push(copy);
-
-  if (type === "ask_question") {
-    pendingAskQuestion = {
-      id: copy.id,
-      questions: copy.questions,
-      title: copy.title,
-    };
-    console.log(`${LOG_PREFIX} 轮次缓冲: ask_question id=${String(copy.id)}`);
-  }
-
-  if (type === "done" || type === "error" || type === "cancelled") {
-    turnStartedAt = null;
-    console.log(`${LOG_PREFIX} 轮次缓冲: 终端事件 ${type}，条数=${turnEventBuffer.length}`);
-  }
+  clients.add(ws);
+  ws.syncReady = true;
+  console.log(`${LOG_PREFIX} WS 客户端已同步，当前 ${clients.size} 个`);
 }
 
 // #endregion
@@ -271,14 +284,15 @@ function serveStatic(req, res) {
 // #region WebSocket 广播
 
 /**
- * 向所有已连接客户端广播 JSON 消息
+ * 向所有已同步客户端广播 JSON 消息（轮次事件自动分配 seq）
  * @param {Record<string, unknown>} msg
  */
 function broadcast(msg) {
-  recordTurnEvent(msg);
-  const payload = JSON.stringify(msg);
+  const event = appendEvent(msg);
+  const outbound = event ?? msg;
+  const payload = JSON.stringify(outbound);
   for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws.syncReady && ws.readyState === WebSocket.OPEN) {
       ws.send(payload);
     }
   }
@@ -399,6 +413,16 @@ async function handleWsMessage(ws, raw) {
 
   try {
     switch (msg.type) {
+      case "hello": {
+        handleClientHello(ws, /** @type {Record<string, unknown>} */ (msg));
+        return;
+      }
+
+      case "ping": {
+        sendTo(ws, { type: "pong" });
+        return;
+      }
+
       // 目录浏览不依赖 ACP 就绪
       case "browse_dir": {
         const listing = browseDirectory(msg.path);
@@ -492,9 +516,7 @@ async function handleWsMessage(ws, raw) {
           await acpClient.setWorkspace(resolved);
           saveWorkspaceDir(resolved);
           fs.mkdirSync(resolved, { recursive: true });
-          turnEventBuffer = [];
-          turnStartedAt = null;
-          pendingAskQuestion = null;
+          resetEventLog();
           promptInFlight = false;
           broadcast(buildSyncPayload());
           broadcast({ type: "system", message: `工作空间已切换: ${resolved}` });
@@ -572,9 +594,7 @@ async function handleWsMessage(ws, raw) {
         break;
 
       case "new_session":
-        turnEventBuffer = [];
-        turnStartedAt = null;
-        pendingAskQuestion = null;
+        resetEventLog();
         promptInFlight = false;
         await acpClient.newSession();
         break;
@@ -635,20 +655,37 @@ async function main() {
   const wss = new WebSocketServer({ server });
 
   wss.on("connection", (ws) => {
-    clients.add(ws);
-    console.log(`${LOG_PREFIX} WS 客户端连接，当前 ${clients.size} 个`);
+    ws.isAlive = true;
+    ws.syncReady = false;
+    console.log(`${LOG_PREFIX} WS 客户端连接，等待 hello`);
 
-    // 下发完整 sync 快照（init + 当前轮次缓冲）
-    sendTo(ws, buildSyncPayload());
-    console.log(
-      `${LOG_PREFIX} sync 已下发 promptInFlight=${promptInFlight} turnEvents=${turnEventBuffer.length}`
-    );
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
 
     ws.on("message", (raw) => handleWsMessage(ws, raw));
     ws.on("close", () => {
       clients.delete(ws);
       console.log(`${LOG_PREFIX} WS 客户端断开，剩余 ${clients.size} 个`);
     });
+  });
+
+  // ponytail: 15s 心跳踢掉僵尸连接（手机锁屏 TCP 半开）
+  const heartbeatTimer = setInterval(() => {
+    for (const ws of wss.clients) {
+      const client = /** @type {WebSocket & { isAlive?: boolean }} */ (ws);
+      if (client.isAlive === false) {
+        console.log(`${LOG_PREFIX} WS 心跳超时，terminate`);
+        client.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      client.ping();
+    }
+  }, WS_HEARTBEAT_MS);
+
+  wss.on("close", () => {
+    clearInterval(heartbeatTimer);
   });
 
   server.listen(PORT, "0.0.0.0", () => {
