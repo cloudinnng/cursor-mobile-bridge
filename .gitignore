@@ -1,0 +1,5 @@
+node_modules/
+.workspace.json
+*.log
+.DS_Store
+Thumbs.db

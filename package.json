@@ -1,0 +1,17 @@
+{
+  "name": "cursor-mobile-bridge",
+  "version": "1.0.0",
+  "description": "Cursor Agent ACP 桥接 — 移动端竖屏 Web UI",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "selfcheck": "node selfcheck.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
