@@ -119,6 +119,37 @@ export function hasToolRawInput(rawInput) {
   return !!rawInput && typeof rawInput === "object" && Object.keys(rawInput).length > 0;
 }
 
+/** 可驱动工具执行的动作字段（description  alone 不算） */
+const ACTIONABLE_RAW_INPUT_KEYS = [
+  "path",
+  "file_path",
+  "filePath",
+  "target_file",
+  "targetFile",
+  "command",
+  "pattern",
+  "glob_pattern",
+  "query",
+  "old_string",
+  "new_string",
+  "contents",
+];
+
+/**
+ * rawInput 是否含路径/命令等动作参数（非仅 description）
+ * @param {unknown} rawInput
+ * @returns {boolean}
+ */
+export function hasActionableToolRawInput(rawInput) {
+  if (!rawInput || typeof rawInput !== "object") return false;
+  const obj = /** @type {Record<string, unknown>} */ (rawInput);
+  return ACTIONABLE_RAW_INPUT_KEYS.some((key) => {
+    const val = obj[key];
+    if (typeof val === "string") return val.trim() !== "";
+    return val != null;
+  });
+}
+
 /**
  * 从 store.db 查找 tool 参数（带简单重试，等 Cursor 落盘）
  * @param {string} sessionId
@@ -188,7 +219,8 @@ export async function enrichToolUpdate(sessionId, update, options = {}) {
       : {};
   const lineRangeKeys = ["offset", "limit", "start_line", "end_line", "line", "startLine", "endLine"];
   const needsRange = lineRangeKeys.some((key) => found.args[key] != null && prev[key] == null);
-  if (hasToolRawInput(update.rawInput) && !needsRange) return update;
+  // ponytail: 仅有 description 时仍从 store.db 补 path/command
+  if (hasActionableToolRawInput(update.rawInput) && !needsRange) return update;
 
   /** @type {Record<string, unknown>} */
   const rawInput = { ...found.args, ...prev };
@@ -218,6 +250,10 @@ export async function enrichToolUpdate(sessionId, update, options = {}) {
       nextTitle = `${found.toolName ?? "Edit"}: ${found.args.target_file}`;
     } else if (typeof found.args.command === "string") {
       nextTitle = `${found.toolName ?? "Shell"}: ${found.args.command}`;
+    } else if (typeof found.args.glob_pattern === "string") {
+      nextTitle = `${found.toolName ?? "Glob"}: ${found.args.glob_pattern}`;
+    } else if (typeof found.args.pattern === "string") {
+      nextTitle = `${found.toolName ?? "Grep"}: ${found.args.pattern}`;
     } else {
       nextTitle = found.toolName ?? title;
     }
@@ -226,8 +262,8 @@ export async function enrichToolUpdate(sessionId, update, options = {}) {
   return {
     ...update,
     title: nextTitle,
-    rawInput: found.args,
-    toolName: found.toolName,
+    rawInput,
+    toolName: found.toolName ?? update.toolName,
   };
 }
 
@@ -238,4 +274,8 @@ console.assert(
     "t1"
   )?.args?.path === "/a.txt",
   "[toolEnricher] extractToolCallFromBlob 自检失败"
+);
+console.assert(
+  hasToolRawInput({ description: "read file" }) && !hasActionableToolRawInput({ description: "read file" }),
+  "[toolEnricher] hasActionableToolRawInput 自检失败"
 );

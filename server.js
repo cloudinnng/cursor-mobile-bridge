@@ -17,7 +17,7 @@ import {
   latestSeq,
   appendEventToLog,
 } from "./acp/eventLog.js";
-import { enrichToolUpdate, hasToolRawInput } from "./acp/toolEnricher.js";
+import { enrichToolUpdate, hasActionableToolRawInput } from "./acp/toolEnricher.js";
 import { browseDirectory, resolveDirPath, formatPathForDisplay, listWorkspaceContents, readWorkspaceFile } from "./fs/dirBrowser.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -327,10 +327,21 @@ function wireAcpEvents(client) {
     // ponytail: Cursor ACP 常发空 rawInput 或丢失 offset/limit，从 store.db 补全后再推
     void enrichToolUpdate(client.sessionId, update, { timeoutMs: 3000 }).then((enriched) => {
       const enrichedInput = enriched.rawInput;
-      const hadInput = hasToolRawInput(update.rawInput);
-      const gotInput = hasToolRawInput(enrichedInput);
-      if (!gotInput && hadInput) return;
-      if (gotInput && hadInput && JSON.stringify(enrichedInput) === JSON.stringify(update.rawInput)) return;
+      if (hasActionableToolRawInput(update.rawInput) && !hasActionableToolRawInput(enrichedInput)) return;
+      if (
+        JSON.stringify({
+          title: enriched.title,
+          toolName: enriched.toolName,
+          rawInput: enrichedInput,
+        }) ===
+        JSON.stringify({
+          title: update.title,
+          toolName: update.toolName,
+          rawInput: update.rawInput,
+        })
+      ) {
+        return;
+      }
       console.log(`${LOG_PREFIX} tool 参数已补全 toolCallId=${enriched.toolCallId}`);
       broadcast({ type: "tool", update: enriched });
     }).catch((err) => {

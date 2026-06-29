@@ -134,10 +134,15 @@ let currentThoughtHeader = null;
 /** @type {string} 当前轮次 thought 原始累积（用于归一化后再展示） */
 let thoughtRawBuffer = "";
 
-/** @typedef {{ block: HTMLElement, header: HTMLElement, statusEl: HTMLElement, body: HTMLElement, data: ToolUpdateData, toolCallIds: Set<string>, mergedParts: ToolUpdateData[], userToggled?: boolean }} ToolBlockEntry */
+/** @typedef {{ data: ToolUpdateData, toolCallIds: Set<string>, mergedParts: ToolUpdateData[], userToggled?: boolean, parentGroup?: ToolGroupEntry | null }} ToolBlockEntry */
+
+/** @typedef {{ block: HTMLElement, header: HTMLElement, statusEl: HTMLElement, body: HTMLElement, children: ToolBlockEntry[], userToggled?: boolean }} ToolGroupEntry */
 
 /** @type {Map<string, ToolBlockEntry>} toolCallId -> 工具块（含合并组） */
 const toolBlocksMap = new Map();
+
+/** @type {ToolGroupEntry | null} 当前轮次内连续工具组（被正文/思考打断后重置） */
+let currentToolGroup = null;
 
 /** @type {Map<string, ToolBlockEntry>} 相同签名 -> 合并后的工具块 */
 const toolSignatureMap = new Map();
@@ -383,6 +388,9 @@ function handleReplay(msg) {
   } else if (last?.type === "error") {
     const errMsg = String(last.message ?? "未知错误");
     appendSystemMsg(`错误: ${errMsg}`);
+    finalizePendingToolBlocks("failed");
+    finalizeCurrentStreamSegment();
+    resetTurnStreamingState();
     setAgentFailed(errMsg);
   } else if (last?.type === "cancelled") {
     setBusy(false);
@@ -481,6 +489,9 @@ function handleServerMessage(msg) {
       }
       appendSystemMsg(`错误: ${errMsg}`);
       if (isBusy) {
+        finalizePendingToolBlocks("failed");
+        finalizeCurrentStreamSegment();
+        resetTurnStreamingState();
         setAgentFailed(errMsg);
       } else {
         setStatus(errMsg, "error");
@@ -491,6 +502,9 @@ function handleServerMessage(msg) {
     case "cancelled":
       trackSeq(msg);
       appendSystemMsg("已取消");
+      finalizePendingToolBlocks("cancelled");
+      finalizeCurrentStreamSegment();
+      resetTurnStreamingState();
       setBusy(false);
       break;
 
@@ -734,6 +748,9 @@ function applySyncEvent(event) {
 
     case "cancelled":
       appendSystemMsg("已取消");
+      finalizePendingToolBlocks("cancelled");
+      finalizeCurrentStreamSegment();
+      resetTurnStreamingState();
       setBusy(false);
       break;
 
@@ -818,6 +835,9 @@ function handleSync(msg) {
       const errMsg = String(last.message ?? "未知错误");
       if (!agentFailed) {
         appendSystemMsg(`错误: ${errMsg}`);
+        finalizePendingToolBlocks("failed");
+        finalizeCurrentStreamSegment();
+        resetTurnStreamingState();
         setAgentFailed(errMsg);
       }
     } else {
@@ -851,6 +871,9 @@ function handleSync(msg) {
   } else if (last?.type === "error") {
     const errMsg = String(last.message ?? "未知错误");
     appendSystemMsg(`错误: ${errMsg}`);
+    finalizePendingToolBlocks("failed");
+    finalizeCurrentStreamSegment();
+    resetTurnStreamingState();
     setAgentFailed(errMsg);
   } else if (last?.type !== "cancelled" && last?.type !== "done") {
     setBusy(false);
@@ -1023,6 +1046,13 @@ function finalizeCurrentStreamSegment() {
 }
 
 /**
+ * 结束当前连续工具组（正文/思考/新轮次插入时调用）
+ */
+function endCurrentToolGroup() {
+  currentToolGroup = null;
+}
+
+/**
  * 创建新的思考块 DOM 并挂到当前轮次
  */
 function createThoughtBlockElement() {
@@ -1043,6 +1073,7 @@ function appendAgentChunk(chunk) {
 
   if (currentStreamSegment !== "message") {
     finalizeCurrentStreamSegment();
+    endCurrentToolGroup();
     currentStreamSegment = "message";
     currentAgentBubble = document.createElement("div");
     currentAgentBubble.className = "msg msg-agent";
@@ -1083,6 +1114,7 @@ function resetTurnStreamingState() {
   toolBlocksMap.clear();
   toolSignatureMap.clear();
   savedToolIds.clear();
+  endCurrentToolGroup();
   console.log("[app] 重置轮次流式状态");
 }
 
@@ -1138,6 +1170,7 @@ function appendThoughtChunk(chunk) {
 
   if (currentStreamSegment !== "thought") {
     finalizeCurrentStreamSegment();
+    endCurrentToolGroup();
     currentStreamSegment = "thought";
     createThoughtBlockElement();
     console.log("[app] 创建思考段 displayLen=", display.length);
@@ -1151,7 +1184,7 @@ function appendThoughtChunk(chunk) {
 }
 
 /**
- * 工具 kind 中文标签
+ * 工具 kind 中文标签（无具体 toolName 时的兜底）
  * @param {string | undefined} kind
  * @returns {string}
  */
@@ -1170,15 +1203,93 @@ function toolKindLabel(kind) {
   return kind ? (map[kind] ?? kind) : "工具";
 }
 
+/** 已知工具英文名（用于从 title 解析） */
+const KNOWN_TOOL_NAMES = [
+  "Glob",
+  "Grep",
+  "SemanticSearch",
+  "Read",
+  "Write",
+  "StrReplace",
+  "Edit",
+  "Shell",
+  "Delete",
+  "ApplyPatch",
+  "Task",
+  "CallMcpTool",
+];
+
+/** toolName → 中文展示名（优先于 kind 泛化标签） */
+const TOOL_DISPLAY_NAME_MAP = {
+  Read: "读文件",
+  Write: "写文件",
+  "Write File": "写文件",
+  StrReplace: "编辑",
+  Edit: "编辑",
+  "Edit File": "编辑",
+  ApplyPatch: "编辑",
+  Shell: "终端",
+  Grep: "搜文件内容",
+  Glob: "筛选文件",
+  SemanticSearch: "语义搜索",
+  Delete: "删除",
+  Task: "子任务",
+  CallMcpTool: "MCP",
+};
+
 /**
- * 工具块 header 显示名（中文类型标签）
+ * 解析具体工具名 — toolName / title / rawInput 启发式
+ * @param {ToolUpdateData} data
+ * @returns {string}
+ */
+function resolveToolName(data) {
+  const explicit = typeof data.toolName === "string" ? data.toolName.trim() : "";
+  if (explicit) return explicit;
+
+  const title = typeof data.title === "string" ? data.title.trim() : "";
+  if (title) {
+    for (const name of KNOWN_TOOL_NAMES) {
+      if (title === name || title.startsWith(`${name}:`) || title.startsWith(`${name} `)) {
+        return name;
+      }
+    }
+  }
+
+  const raw = data.rawInput;
+  if (raw && typeof raw === "object") {
+    if (typeof raw.glob_pattern === "string") return "Glob";
+    if (typeof raw.pattern === "string") return "Grep";
+    if (typeof raw.query === "string" && typeof raw.path !== "string") return "SemanticSearch";
+    // ponytail: Glob 结果偶发落在 rawInput/rawOutput 的 totalFiles 字段
+    if ("totalFiles" in raw && !("pattern" in raw)) return "Glob";
+  }
+
+  const out = data.rawOutput;
+  if (out && typeof out === "object" && "totalFiles" in out) return "Glob";
+
+  return "";
+}
+
+/**
+ * 工具块展示名 — 具体工具中文名，避免 kind=search 一律显示「搜索」
+ * @param {ToolUpdateData} data
+ * @returns {string}
+ */
+function toolDisplayLabel(data) {
+  const name = resolveToolName(data);
+  if (name && TOOL_DISPLAY_NAME_MAP[name]) return TOOL_DISPLAY_NAME_MAP[name];
+  if (name) return name;
+  if (data.kind) return toolKindLabel(data.kind);
+  return "工具";
+}
+
+/**
+ * 工具块 header 显示名
  * @param {ToolUpdateData} data
  * @returns {string}
  */
 function toolHeaderName(data) {
-  if (data.kind) return toolKindLabel(data.kind);
-  if (data.toolName) return data.toolName;
-  return "工具";
+  return toolDisplayLabel(data);
 }
 
 /**
@@ -1196,6 +1307,52 @@ function toolStatusLabel(status) {
   };
   return status ? (map[status] ?? status) : "未知";
 }
+
+/** 工具终态 — 不应被后续非终态 update 覆盖 */
+const TOOL_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+/**
+ * 合并工具 status — 保留终态，避免乱序 update 回退到 pending
+ * @param {string | undefined} prevStatus
+ * @param {string | undefined} incomingStatus
+ * @returns {string | undefined}
+ */
+function mergeToolStatus(prevStatus, incomingStatus) {
+  const prev = prevStatus ?? "pending";
+  if (!incomingStatus) return prevStatus ?? "pending";
+  if (TOOL_TERMINAL_STATUSES.has(prev)) return prev;
+  if (TOOL_TERMINAL_STATUSES.has(incomingStatus)) return incomingStatus;
+  if (prev === "in_progress" && incomingStatus === "pending") return "in_progress";
+  return incomingStatus;
+}
+
+/**
+ * 归一化单条工具 part 的 status — ACP 有时有 rawOutput 但缺少 completed 终态
+ * @param {ToolUpdateData} part
+ * @returns {string}
+ */
+function normalizeToolPartStatus(part) {
+  const status = part.status ?? "pending";
+  if (TOOL_TERMINAL_STATUSES.has(status)) return status;
+  if (status !== "pending" && status !== "in_progress") return status;
+
+  const out = part.rawOutput;
+  if (out && typeof out === "object" && Object.keys(out).length > 0) {
+    const exitCode = out.exitCode;
+    if (typeof exitCode === "number" && exitCode !== 0) return "failed";
+    return "completed";
+  }
+  return status;
+}
+
+console.assert(
+  mergeToolStatus("completed", "in_progress") === "completed",
+  "[app] mergeToolStatus 自检失败"
+);
+console.assert(
+  normalizeToolPartStatus({ status: "in_progress", rawOutput: { exitCode: 0 } }) === "completed",
+  "[app] normalizeToolPartStatus 自检失败"
+);
 
 /**
  * 合并 rawInput — 忽略空对象，避免后续 update 覆盖已有参数
@@ -1495,9 +1652,12 @@ function formatToolRawInput(rawInput, opts = {}) {
     delete displayInput.new_string;
     delete displayInput.old_string;
     delete displayInput.contents;
+    delete displayInput.description;
     if (typeof displayInput.command === "string" && displayInput.command.includes("\n")) {
       delete displayInput.command;
     }
+  } else {
+    delete displayInput.description;
   }
 
   const summary = [];
@@ -1507,6 +1667,7 @@ function formatToolRawInput(rawInput, opts = {}) {
   }
   const pathKey = TOOL_FILE_PATH_KEYS.find((key) => typeof rawInput[key] === "string");
   if (pathKey) summary.push(`路径: ${String(rawInput[pathKey])}`);
+  if (typeof rawInput.glob_pattern === "string") summary.push(`筛选: ${rawInput.glob_pattern}`);
   if (typeof rawInput.pattern === "string") summary.push(`搜索: ${rawInput.pattern}`);
 
   if (Object.keys(displayInput).length === 0) {
@@ -1595,6 +1756,7 @@ function mergeToolUpdate(prev, incoming) {
     ...prev,
     ...incoming,
     toolCallId: prev.toolCallId ?? incoming.toolCallId,
+    status: mergeToolStatus(prev.status, incoming.status),
     rawInput: mergeToolRawInput(prev.rawInput, incoming.rawInput),
     rawOutput: mergeToolRawOutput(
       /** @type {Record<string, unknown> | undefined} */ (prev.rawOutput),
@@ -1661,7 +1823,7 @@ function computeToolSignature(data) {
  * @returns {string}
  */
 function aggregateToolStatus(parts) {
-  const statuses = parts.map((p) => p.status ?? "pending");
+  const statuses = parts.map((p) => normalizeToolPartStatus(p));
   if (statuses.some((s) => s === "in_progress")) return "in_progress";
   if (statuses.some((s) => s === "pending")) return "pending";
   if (statuses.some((s) => s === "failed")) return "failed";
@@ -1740,6 +1902,34 @@ const GENERIC_TOOL_TITLES = new Set([
 ]);
 
 /**
+ * 工具调用简短意图 — 优先 Agent 填写的 description，否则 title / 路径 / 命令摘要
+ * @param {ToolUpdateData} data
+ * @returns {string}
+ */
+function toolCallIntent(data) {
+  const raw = data.rawInput;
+  if (raw && typeof raw === "object") {
+    const desc = raw.description;
+    if (typeof desc === "string" && desc.trim()) return desc.trim();
+  }
+
+  const title = typeof data.title === "string" ? data.title.trim() : "";
+  if (title && !GENERIC_TOOL_TITLES.has(title)) return title;
+
+  if (raw && typeof raw === "object") {
+    const pathKey = TOOL_FILE_PATH_KEYS.find((key) => typeof raw[key] === "string");
+    if (pathKey) return shortenToolPath(String(raw[pathKey]));
+    if (typeof raw.command === "string" && raw.command.trim()) {
+      const cmd = raw.command.trim().replace(/\s+/g, " ");
+      return cmd.length > 80 ? `${cmd.slice(0, 77)}...` : cmd;
+    }
+    if (typeof raw.pattern === "string" && raw.pattern.trim()) return raw.pattern.trim();
+  }
+
+  return "";
+}
+
+/**
  * 从 file:// URI 提取路径
  * @param {string} uri
  * @returns {string}
@@ -1816,7 +2006,102 @@ function extractToolFilePath(data) {
     }
   }
 
-  return parseToolPathFromTitle(data.title, data.toolName);
+  return parseToolPathFromTitle(data.title, resolveToolName(data) || data.toolName);
+}
+
+/**
+ * 从工具条目中选取路径信息最完整的一条（优先最新 data）
+ * @param {ToolBlockEntry} entry
+ * @returns {ToolUpdateData}
+ */
+function pickBestToolPartForSummary(entry) {
+  const candidates = [entry.data, ...entry.mergedParts];
+  for (const part of candidates) {
+    if (extractToolFilePath(part)) return part;
+  }
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const part = candidates[i];
+    if (toolCallIntent(part)) return part;
+  }
+  return entry.data;
+}
+
+/**
+ * 工具路径展示 — 优先相对工作空间前缀
+ * @param {string} path
+ * @returns {string}
+ */
+function formatToolPathForDisplay(path) {
+  if (!path) return "";
+  const norm = path.replace(/\\/g, "/");
+  const ws = currentWorkspacePath.replace(/\\/g, "/").replace(/\/$/, "");
+  if (ws && (norm === ws || norm.startsWith(`${ws}/`))) {
+    const rel = norm === ws ? "" : norm.slice(ws.length + 1);
+    return rel || "/";
+  }
+  return norm;
+}
+
+/**
+ * 从单条工具 update 提取行数/范围摘要
+ * @param {ToolUpdateData} part
+ * @returns {string}
+ */
+function summarizeToolLineInfo(part) {
+  const diffBlocks = collectToolDiffBlocks(part);
+  if (diffBlocks.length > 0) {
+    let totalAffected = 0;
+    let startLine = diffBlocks[0].startLine;
+    for (const block of diffBlocks) {
+      totalAffected += countDiffAffectedLines(block.oldText, block.newText);
+      if (block.startLine < startLine) startLine = block.startLine;
+    }
+    if (totalAffected > 0) return formatLineRange(startLine, totalAffected);
+  }
+
+  const raw = part.rawInput;
+  if (raw && typeof raw === "object") {
+    const limit = parseToolNumericField(raw, ["limit"]);
+    const startLine = getToolStartLine(part);
+    if (limit != null && limit > 0) return formatLineRange(startLine, limit);
+  }
+
+  if (Array.isArray(part.locations)) {
+    for (const loc of part.locations) {
+      if (loc.line != null && loc.line > 0) return `L${loc.line}`;
+    }
+  }
+
+  const out = /** @type {Record<string, unknown> | undefined} */ (part.rawOutput);
+  if (out && typeof out.content === "string" && out.content) {
+    const lines = normalizeLines(out.content);
+    if (lines.length > 0) return formatLineRange(getToolStartLine(part), lines.length);
+  }
+
+  return "";
+}
+
+/**
+ * 单条工具调用紧凑摘要（组内列表行）
+ * @param {ToolUpdateData} part
+ * @returns {string}
+ */
+function summarizeToolPart(part) {
+  const label = toolDisplayLabel(part);
+  const filePath = extractToolFilePath(part);
+  const displayPath = filePath ? formatToolPathForDisplay(filePath) : "";
+
+  if (displayPath) {
+    /** @type {string[]} */
+    const segments = [label, displayPath];
+    const lineInfo = summarizeToolLineInfo(part);
+    if (lineInfo) segments.push(lineInfo);
+    return segments.join(" · ");
+  }
+
+  const intent = toolCallIntent(part);
+  if (intent && intent !== label) return `${label} · ${intent}`;
+  return label;
 }
 
 /**
@@ -1954,8 +2239,7 @@ function buildToolMetaLines(data, hooks = {}) {
   const lines = [];
 
   if (filePath) lines.push(`文件: ${filePath}`);
-  if (data.toolName) lines.push(`工具: ${data.toolName}`);
-  if (data.kind) lines.push(`类型: ${toolKindLabel(data.kind)}`);
+  lines.push(`工具: ${toolDisplayLabel(data)}`);
 
   const inputText = formatToolRawInput(data.rawInput, { skipCodeFields: true });
   if (inputText) lines.push(inputText);
@@ -2110,78 +2394,231 @@ function formatToolBody(data, mergedParts = []) {
 }
 
 /**
- * 更新工具块 UI
- * @param {ToolBlockEntry} entry
+ * 收集工具组内全部 part（含同签名 mergedParts）
+ * @param {ToolGroupEntry} group
+ * @returns {ToolUpdateData[]}
  */
-function renderToolBlock(entry) {
-  const { header, statusEl, body, data, block, mergedParts } = entry;
-  const primary = mergedParts.length > 0 ? mergedParts[0] : data;
-  const titleEl = header.querySelector(".block-title");
-  if (titleEl) titleEl.textContent = toolHeaderName(primary);
+function collectToolGroupParts(group) {
+  /** @type {ToolUpdateData[]} */
+  const parts = [];
+  for (const child of group.children) {
+    if (child.mergedParts.length > 0) parts.push(...child.mergedParts);
+    else parts.push(child.data);
+  }
+  return parts;
+}
 
-  const status = aggregateToolStatus(mergedParts.length > 0 ? mergedParts : [data]);
+/**
+ * 更新连续工具组 UI（紧凑列表，无 diff 正文）
+ * @param {ToolGroupEntry} group
+ */
+function renderToolGroup(group) {
+  const { block, header, statusEl, body, children } = group;
+  const count = children.length;
+
+  const titleEl = header.querySelector(".block-title");
+  if (titleEl) titleEl.textContent = `工具调用 (${count})`;
+
+  const intentEl = header.querySelector(".tool-intent");
+  const inProgress = children.filter((child) => {
+    const parts = child.mergedParts.length > 0 ? child.mergedParts : [child.data];
+    const status = aggregateToolStatus(parts);
+    return status === "pending" || status === "in_progress";
+  }).length;
+  if (intentEl) {
+    if (inProgress > 0) {
+      intentEl.textContent = `${inProgress} 个执行中`;
+      intentEl.hidden = false;
+    } else {
+      intentEl.textContent = "";
+      intentEl.hidden = true;
+    }
+  }
+
+  const allParts = collectToolGroupParts(group);
+  const status = aggregateToolStatus(allParts);
   statusEl.textContent = toolStatusLabel(status);
   statusEl.className = `block-badge tool-status-${status}`;
 
-  const diffHtml = renderToolBodyHtml(data, mergedParts);
-  if (diffHtml) {
-    body.innerHTML = diffHtml;
-    body.classList.add("tool-body-has-diff");
-    console.log("[app] 工具块 diff 高亮渲染 mergedParts=", mergedParts.length);
-  } else {
-    body.textContent = formatToolBody(data, mergedParts);
-    body.classList.remove("tool-body-has-diff");
-  }
+  const rows = children
+    .map((child) => {
+      const primary = pickBestToolPartForSummary(child);
+      let summary = summarizeToolPart(primary);
+      if (child.mergedParts.length > 1) summary += ` ×${child.mergedParts.length}`;
+      return `<li class="tool-group-row">${escapeHtml(summary)}</li>`;
+    })
+    .join("");
+  body.innerHTML = `<ul class="tool-group-list">${rows}</ul>`;
 
-  // 执行中展开、完成后折叠；用户手动切换后不再自动改
-  if (!entry.userToggled) {
+  if (!group.userToggled) {
     block.classList.toggle("expanded", status === "pending" || status === "in_progress");
   }
 }
 
 /**
- * 创建新的工具块 DOM（默认折叠）
- * @param {ToolUpdateData} data
- * @returns {ToolBlockEntry}
+ * 创建连续工具组 DOM 容器
+ * @param {ToolBlockEntry} firstChild
+ * @returns {ToolGroupEntry}
  */
-function createToolBlockEntry(data) {
+function createToolGroupEntry(firstChild) {
   const block = document.createElement("div");
-  block.className = "tool-block";
+  block.className = "tool-group";
 
   const header = document.createElement("div");
-  header.className = "tool-header";
-  header.innerHTML = `<span class="block-icon">🔧</span><span class="block-title">${escapeHtml(toolHeaderName(data))}</span><span class="block-badge tool-status-pending">等待</span>`;
+  header.className = "tool-header tool-group-header";
+  header.innerHTML =
+    `<span class="block-icon">🔧</span>` +
+    `<div class="tool-header-text">` +
+    `<span class="block-title">工具调用 (1)</span>` +
+    `<span class="tool-intent" hidden></span>` +
+    `</div>` +
+    `<span class="block-badge tool-status-pending">等待</span>`;
 
-  const statusEl = header.querySelector(".block-badge");
-
+  const statusEl = /** @type {HTMLElement} */ (header.querySelector(".block-badge"));
   const body = document.createElement("div");
-  body.className = "tool-body";
+  body.className = "tool-body tool-group-body";
 
   block.appendChild(header);
   block.appendChild(body);
 
+  firstChild.parentGroup = null;
+
+  /** @type {ToolGroupEntry} */
+  const group = {
+    block,
+    header,
+    statusEl,
+    body,
+    children: [firstChild],
+    userToggled: false,
+  };
+
+  firstChild.parentGroup = group;
+
+  header.addEventListener("click", () => {
+    group.userToggled = true;
+    block.classList.toggle("expanded");
+    console.log("[app] 工具组手动切换 expanded=", block.classList.contains("expanded"));
+  });
+
+  return group;
+}
+
+/**
+ * 创建工具逻辑条目（无独立 DOM，由 tool-group 统一展示）
+ * @param {ToolUpdateData} data
+ * @returns {ToolBlockEntry}
+ */
+function createToolBlockEntry(data) {
   const toolCallId = data.toolCallId ?? makeEphemeralId("tool");
   const normalized = { ...data, toolCallId };
 
-  /** @type {ToolBlockEntry} */
-  const entry = {
-    block,
-    header: /** @type {HTMLElement} */ (header),
-    statusEl: /** @type {HTMLElement} */ (statusEl),
-    body,
+  return {
     data: normalized,
     toolCallIds: new Set([toolCallId]),
     mergedParts: [normalized],
     userToggled: false,
+    parentGroup: null,
   };
+}
 
-  header.addEventListener("click", () => {
-    entry.userToggled = true;
-    block.classList.toggle("expanded");
-    console.log("[app] 工具块手动切换 expanded=", block.classList.contains("expanded"));
+/**
+ * 将新工具条目挂入当前连续组（无组则新建）
+ * @param {ToolBlockEntry} entry
+ * @param {HTMLElement | null} turn
+ * @returns {ToolGroupEntry}
+ */
+function attachToolEntryToGroup(entry, turn) {
+  if (currentToolGroup) {
+    entry.parentGroup = currentToolGroup;
+    currentToolGroup.children.push(entry);
+    return currentToolGroup;
+  }
+
+  const group = createToolGroupEntry(entry);
+  if (turn) {
+    turn.appendChild(group.block);
+  } else {
+    messagesEl.appendChild(group.block);
+  }
+  currentToolGroup = group;
+  console.log("[app] 创建工具组");
+  return group;
+}
+
+/**
+ * 工具达到终态时写入 localStorage（每个 toolCallId 只存一次）
+ * @param {ToolUpdateData} part
+ */
+function persistToolPartIfNeeded(part) {
+  const toolCallId = part.toolCallId;
+  if (!toolCallId || savedToolIds.has(toolCallId)) return;
+
+  const finalStatus = normalizeToolPartStatus(part);
+  if (finalStatus !== "completed" && finalStatus !== "failed") return;
+
+  savedToolIds.add(toolCallId);
+  saveHistory({
+    role: "tool",
+    text: summarizeToolPart(part),
+    meta: { ...part, status: finalStatus },
   });
+  console.log("[app] 工具块已持久化 toolCallId=", toolCallId, "status=", finalStatus);
 
-  return entry;
+  if (finalStatus === "completed" && isFilesystemMutatingTool(part)) {
+    console.log("[app] 工具修改工作空间文件，刷新文件树 toolName=", part.toolName, "kind=", part.kind);
+    scheduleFileExplorerRefresh();
+  }
+}
+
+/**
+ * 轮次结束时补全仍停留在 pending/in_progress 的工具块
+ * ponytail: Cursor ACP 偶发不发 tool completed 终态，done 后统一收口
+ * @param {"completed" | "failed" | "cancelled"} [finalStatus]
+ */
+function finalizePendingToolBlocks(finalStatus = "completed") {
+  /** @type {Set<ToolBlockEntry>} */
+  const entries = new Set(toolBlocksMap.values());
+  if (entries.size === 0) return;
+
+  /** @type {Set<ToolGroupEntry>} */
+  const groupsToRender = new Set();
+  let finalized = 0;
+
+  for (const entry of entries) {
+    let changed = false;
+
+    for (const part of entry.mergedParts) {
+      const normalized = normalizeToolPartStatus(part);
+      if (normalized === "pending" || normalized === "in_progress") {
+        part.status = finalStatus;
+        changed = true;
+      }
+    }
+
+    const dataNormalized = normalizeToolPartStatus(entry.data);
+    if (dataNormalized === "pending" || dataNormalized === "in_progress") {
+      entry.data.status = finalStatus;
+      changed = true;
+    }
+
+    if (changed) {
+      if (entry.parentGroup) groupsToRender.add(entry.parentGroup);
+      finalized++;
+    }
+
+    for (const part of entry.mergedParts) {
+      persistToolPartIfNeeded(part);
+    }
+  }
+
+  for (const group of groupsToRender) {
+    renderToolGroup(group);
+  }
+
+  if (finalized > 0) {
+    console.log("[app] 轮次结束补全工具块 status=", finalStatus, "count=", finalized);
+  }
 }
 
 /**
@@ -2198,6 +2635,8 @@ function appendToolBlock(update) {
   const data = { ...incoming, toolCallId };
 
   let entry = toolBlocksMap.get(toolCallId);
+  /** @type {ToolGroupEntry | null} */
+  let groupToRender = null;
 
   if (!entry) {
     const signature = computeToolSignature(data);
@@ -2214,20 +2653,17 @@ function appendToolBlock(update) {
       }
       entry.data = mergeToolUpdate(entry.data, data);
       toolBlocksMap.set(toolCallId, entry);
+      groupToRender = entry.parentGroup ?? null;
       console.log("[app] 合并相同工具调用 signature=", signature, "count=", entry.toolCallIds.size);
     } else {
-      // 新工具块插入 DOM 时才打断当前思考/正文流
+      // 新工具插入时打断思考/正文流；连续工具不打断、不结束 tool-group
       finalizeCurrentStreamSegment();
       entry = createToolBlockEntry(data);
       const turn = ensureTurnContainer();
-      if (turn) {
-        turn.appendChild(entry.block);
-      } else {
-        messagesEl.appendChild(entry.block);
-      }
+      groupToRender = attachToolEntryToGroup(entry, turn);
       toolBlocksMap.set(toolCallId, entry);
       if (!isRestoringHistory) toolSignatureMap.set(signature, entry);
-      console.log("[app] 创建工具块 toolCallId=", toolCallId, "signature=", signature);
+      console.log("[app] 创建工具条目 toolCallId=", toolCallId, "signature=", signature);
     }
   } else {
     entry.data = mergeToolUpdate(entry.data, data);
@@ -2237,8 +2673,9 @@ function appendToolBlock(update) {
     } else {
       entry.mergedParts.push({ ...data });
     }
+    groupToRender = entry.parentGroup ?? null;
     console.log(
-      "[app] 更新工具块 toolCallId=",
+      "[app] 更新工具条目 toolCallId=",
       toolCallId,
       "status=",
       entry.data.status,
@@ -2247,22 +2684,12 @@ function appendToolBlock(update) {
     );
   }
 
-  renderToolBlock(entry);
+  if (groupToRender) {
+    renderToolGroup(groupToRender);
+  }
 
-  // 工具完成时写入历史（每个 toolCallId 只存一次）
   const part = entry.mergedParts.find((p) => p.toolCallId === toolCallId) ?? entry.data;
-  const finalStatus = part.status ?? entry.data.status;
-  const shouldPersistTool =
-    (finalStatus === "completed" || finalStatus === "failed") && toolCallId && !savedToolIds.has(toolCallId);
-  if (shouldPersistTool) {
-    savedToolIds.add(toolCallId);
-    saveHistory({ role: "tool", text: formatToolBody(part), meta: { ...part } });
-  }
-
-  if (shouldPersistTool && finalStatus === "completed" && isFilesystemMutatingTool(part)) {
-    console.log("[app] 工具修改工作空间文件，刷新文件树 toolName=", part.toolName, "kind=", part.kind);
-    scheduleFileExplorerRefresh();
-  }
+  persistToolPartIfNeeded(part);
 
   scrollToBottom();
 }
@@ -2320,6 +2747,7 @@ function appendSystemMsg(text) {
 function finishAgentReply(stopReason) {
   removeTypingIndicator();
   finalizeCurrentStreamSegment();
+  finalizePendingToolBlocks("completed");
   resetTurnStreamingState();
 
   if (stopReason && stopReason !== "end_turn") {
@@ -2417,6 +2845,28 @@ function getActiveUserTurnIndex(turns) {
 }
 
 /**
+ * 计算指定用户对话对齐到顶部的 scrollTop
+ * @param {HTMLElement[]} turns
+ * @param {number} index
+ * @returns {number}
+ */
+function getUserTurnScrollTop(turns, index) {
+  return Math.max(0, getTurnTopInMessages(turns[index]) - 8);
+}
+
+/**
+ * 当前滚动位置是否已对齐到指定用户对话顶部（仍在该轮 Agent 内容区则未对齐）
+ * @param {HTMLElement[]} turns
+ * @param {number} index
+ * @returns {boolean}
+ */
+function isAlignedToUserTurn(turns, index) {
+  if (index < 0 || index >= turns.length) return false;
+  const targetTop = getUserTurnScrollTop(turns, index);
+  return Math.abs(messagesEl.scrollTop - targetTop) <= 12;
+}
+
+/**
  * 滚动到指定索引的用户对话（对齐到消息区顶部）
  * @param {number} index
  */
@@ -2425,8 +2875,7 @@ function scrollToUserTurn(index) {
   if (index < 0 || index >= turns.length) return;
 
   scrollLockedToBottom = false;
-  const targetTop = Math.max(0, getTurnTopInMessages(turns[index]) - 8);
-  messagesEl.scrollTop = targetTop;
+  messagesEl.scrollTop = getUserTurnScrollTop(turns, index);
   console.log("[app] 导航到用户对话", index + 1, "/", turns.length);
   updateScrollBottomButton();
   updateTurnNavButtons();
@@ -2444,9 +2893,14 @@ function updateTurnNavButtons() {
   if (isRestoringHistory || count <= 1) return;
 
   const idx = getActiveUserTurnIndex(turns);
-  btnNavTurnUp.disabled = idx <= 0;
+  const atCurrentUserTop = idx >= 0 && isAlignedToUserTurn(turns, idx);
+  btnNavTurnUp.disabled = idx < 0 || (atCurrentUserTop && idx <= 0);
   btnNavTurnDown.disabled = idx >= count - 1;
-  btnNavTurnUp.title = idx > 0 ? `上一条对话 (${idx}/${count})` : "已是第一条对话";
+  btnNavTurnUp.title = !atCurrentUserTop && idx >= 0
+    ? "回到本轮用户消息"
+    : idx > 0
+      ? `上一条对话 (${idx}/${count})`
+      : "已是第一条对话";
   btnNavTurnDown.title = idx < count - 1 ? `下一条对话 (${idx + 2}/${count})` : "已是最后一条对话";
 }
 
@@ -3415,14 +3869,55 @@ function appendRestoredThoughtBlock(rawText, parentEl = messagesEl) {
 }
 
 /**
- * 恢复历史中的工具块 DOM（不写入流式索引）
- * @param {Record<string, unknown>} meta
+ * 将轮次条目按连续 tool 分段（供历史恢复与自检）
+ * @param {HistoryEntry[]} turnEntries
+ * @returns {Array<{ type: "thought" | "tool" | "agent", entry?: HistoryEntry, toolMetas?: Record<string, unknown>[] }>}
+ */
+function segmentTurnEntriesForRestore(turnEntries) {
+  /** @type {Array<{ type: "thought" | "tool" | "agent", entry?: HistoryEntry, toolMetas?: Record<string, unknown>[] }>} */
+  const segments = [];
+  let i = 0;
+  while (i < turnEntries.length) {
+    const entry = turnEntries[i];
+    if (entry.role === "tool") {
+      /** @type {Record<string, unknown>[]} */
+      const toolMetas = [];
+      while (i < turnEntries.length && turnEntries[i].role === "tool") {
+        toolMetas.push(turnEntries[i].meta ?? {});
+        i++;
+      }
+      segments.push({ type: "tool", toolMetas });
+    } else if (entry.role === "thought") {
+      segments.push({ type: "thought", entry });
+      i++;
+    } else if (entry.role === "agent") {
+      segments.push({ type: "agent", entry });
+      i++;
+    } else {
+      i++;
+    }
+  }
+  return segments;
+}
+
+/**
+ * 恢复历史中的连续工具组 DOM
+ * @param {Record<string, unknown>[]} metas
  * @param {HTMLElement} parentEl
  */
-function appendRestoredToolBlock(meta, parentEl) {
-  const entry = createToolBlockEntry(/** @type {ToolUpdateData} */ (meta));
-  renderToolBlock(entry);
-  parentEl.appendChild(entry.block);
+function appendRestoredToolGroup(metas, parentEl) {
+  if (metas.length === 0) return;
+
+  const first = createToolBlockEntry(/** @type {ToolUpdateData} */ (metas[0]));
+  const group = createToolGroupEntry(first);
+  for (let i = 1; i < metas.length; i++) {
+    const child = createToolBlockEntry(/** @type {ToolUpdateData} */ (metas[i]));
+    child.parentGroup = group;
+    group.children.push(child);
+  }
+  renderToolGroup(group);
+  parentEl.appendChild(group.block);
+  console.log("[app] 恢复工具组 count=", metas.length);
 }
 
 /**
@@ -3436,15 +3931,16 @@ function appendRestoredAgentTurn(turnEntries) {
   turnEl.className = "agent-turn";
   messagesEl.appendChild(turnEl);
 
-  for (const entry of turnEntries) {
-    if (entry.role === "thought") {
-      appendRestoredThoughtBlock(entry.text, turnEl);
-    } else if (entry.role === "tool") {
-      appendRestoredToolBlock(entry.meta ?? {}, turnEl);
-    } else if (entry.role === "agent") {
+  const segments = segmentTurnEntriesForRestore(turnEntries);
+  for (const seg of segments) {
+    if (seg.type === "thought" && seg.entry) {
+      appendRestoredThoughtBlock(seg.entry.text, turnEl);
+    } else if (seg.type === "tool" && seg.toolMetas) {
+      appendRestoredToolGroup(seg.toolMetas, turnEl);
+    } else if (seg.type === "agent" && seg.entry) {
       const el = document.createElement("div");
       el.className = "msg msg-agent";
-      el.textContent = entry.text;
+      el.textContent = seg.entry.text;
       turnEl.appendChild(el);
     }
   }
@@ -3636,7 +4132,13 @@ btnScrollBottom?.addEventListener("click", () => {
 btnNavTurnUp?.addEventListener("click", () => {
   const turns = getUserTurnElements();
   const idx = getActiveUserTurnIndex(turns);
-  if (idx > 0) scrollToUserTurn(idx - 1);
+  if (idx < 0) return;
+  // 在 Agent 内容区：先对齐本轮用户消息；已对齐时再跳到上一轮
+  if (isAlignedToUserTurn(turns, idx)) {
+    if (idx > 0) scrollToUserTurn(idx - 1);
+  } else {
+    scrollToUserTurn(idx);
+  }
 });
 
 btnNavTurnDown?.addEventListener("click", () => {
@@ -3770,8 +4272,24 @@ console.assert(
 );
 console.assert(
   toolHeaderName({ kind: "read" }) === "读文件" &&
-    toolHeaderName({ toolName: "Shell" }) === "Shell",
+    toolHeaderName({ toolName: "Shell" }) === "终端" &&
+    toolHeaderName({ kind: "search", toolName: "Glob" }) === "筛选文件" &&
+    toolHeaderName({ kind: "search", toolName: "Grep" }) === "搜文件内容" &&
+    toolHeaderName({ kind: "search", rawInput: { glob_pattern: "**/*.js" } }) === "筛选文件" &&
+    toolHeaderName({ kind: "search", rawInput: { pattern: "foo", totalFiles: 3 } }) === "搜文件内容" &&
+    toolHeaderName({ kind: "search", rawInput: { totalFiles: 66, truncated: false } }) === "筛选文件",
   "[app] toolHeaderName 自检失败"
+);
+console.assert(
+  resolveToolName({ title: "Glob: **/*.js" }) === "Glob" &&
+    resolveToolName({ rawInput: { pattern: "x" } }) === "Grep",
+  "[app] resolveToolName 自检失败"
+);
+console.assert(
+  toolCallIntent({ rawInput: { description: "Find tool handlers" } }) === "Find tool handlers" &&
+    toolCallIntent({ title: "Read: app.js", rawInput: {} }) === "Read: app.js" &&
+    toolCallIntent({ rawInput: { path: "/proj/src/app.js" } }) === "app.js",
+  "[app] toolCallIntent 自检失败"
 );
 console.assert(
   prefixLineNumbers("a\nb", 10).startsWith(" 10 │"),
@@ -3792,6 +4310,78 @@ console.assert(
     "thought,agent,tool,agent",
   "[app] 轮次块顺序自检失败"
 );
+console.assert(
+  summarizeToolPart({
+    toolName: "StrReplace",
+    kind: "edit",
+    rawInput: { path: "/proj/utils.js", old_string: "a\nb", new_string: "a\nc", offset: 10 },
+  }).includes("utils.js") && summarizeToolPart({
+    toolName: "StrReplace",
+    kind: "edit",
+    rawInput: { path: "/proj/utils.js", old_string: "a\nb", new_string: "a\nc", offset: 10 },
+  }).includes("L10"),
+  "[app] summarizeToolPart edit 自检失败"
+);
+console.assert(
+  summarizeToolPart({ toolName: "Read", kind: "read", rawInput: { path: "/proj/app.js", limit: 5, offset: 10 } }).includes(
+    "L10-14"
+  ),
+  "[app] summarizeToolPart read 自检失败"
+);
+console.assert(
+  summarizeToolPart({
+    toolName: "Shell",
+    kind: "execute",
+    rawInput: { command: "git status", description: "check git" },
+  }) === "终端 · check git",
+  "[app] summarizeToolPart shell 自检失败"
+);
+console.assert(
+  summarizeToolPart({ kind: "read", title: "Read: public/app.js" }).includes("app.js"),
+  "[app] summarizeToolPart title path 自检失败"
+);
+console.assert(
+  pickBestToolPartForSummary({
+    data: { kind: "read", rawInput: { description: "x" } },
+    mergedParts: [{ kind: "read", rawInput: { path: "/p/a.js" } }],
+    toolCallIds: new Set(),
+  }).rawInput?.path === "/p/a.js",
+  "[app] pickBestToolPartForSummary 自检失败"
+);
+console.assert(
+  segmentTurnEntriesForRestore([
+    { role: "tool", text: "", meta: { toolCallId: "a" } },
+    { role: "tool", text: "", meta: { toolCallId: "b" } },
+    { role: "agent", text: "ok" },
+  ]).length === 2 &&
+    segmentTurnEntriesForRestore([
+      { role: "tool", text: "", meta: { toolCallId: "a" } },
+      { role: "tool", text: "", meta: { toolCallId: "b" } },
+      { role: "agent", text: "ok" },
+    ])[0].toolMetas?.length === 2,
+  "[app] segmentTurnEntriesForRestore 自检失败"
+);
+(function toolGroupRenderSelfCheck() {
+  const c1 = createToolBlockEntry({
+    toolName: "Read",
+    kind: "read",
+    rawInput: { path: "/proj/a.js", limit: 3, offset: 1 },
+  });
+  const c2 = createToolBlockEntry({
+    toolName: "Grep",
+    kind: "search",
+    rawInput: { pattern: "foo" },
+  });
+  const group = createToolGroupEntry(c1);
+  c2.parentGroup = group;
+  group.children.push(c2);
+  renderToolGroup(group);
+  const html = group.body.innerHTML;
+  console.assert(
+    (html.match(/tool-group-row/g) || []).length === 2 && !html.includes("tool-diff-line"),
+    "[app] renderToolGroup 自检失败"
+  );
+})();
 
 restoreHistory();
 connectWs();
