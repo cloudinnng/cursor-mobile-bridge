@@ -575,6 +575,9 @@ select {
   color: #aaaacc;
   white-space: pre-wrap;
   word-break: break-word;
+  max-height: min(50vh, 600px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .thought-block.expanded .thought-body {

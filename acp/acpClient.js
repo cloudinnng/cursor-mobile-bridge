@@ -566,11 +566,12 @@ export class AcpClient extends EventEmitter {
    * 发送 thought 事件 — 原样转发，归一化/过滤由前端 thoughtRawBuffer 统一处理
    * ponytail: 不在此按 chunk 过滤，避免分隔符与正文跨 chunk 时丢字
    * @param {string} text
+   * @param {string | number | null | undefined} [messageId]
    */
-  #emitThoughtChunk(text) {
+  #emitThoughtChunk(text, messageId) {
     if (!text) return;
-    console.log(`${LOG_PREFIX} thought chunk len=${text.length}`);
-    this.emit("thought", { text });
+    console.log(`${LOG_PREFIX} thought chunk len=${text.length} messageId=${messageId ?? "—"}`);
+    this.emit("thought", { text, messageId: messageId ?? null });
   }
 
   /**
@@ -598,7 +599,7 @@ export class AcpClient extends EventEmitter {
             JSON.stringify(update.content).slice(0, 240)
           );
         }
-        this.#emitThoughtChunk(text);
+        this.#emitThoughtChunk(text, update.messageId);
         break;
       }
 

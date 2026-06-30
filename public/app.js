@@ -134,6 +134,9 @@ let currentThoughtHeader = null;
 /** @type {string} 当前轮次 thought 原始累积（用于归一化后再展示） */
 let thoughtRawBuffer = "";
 
+/** @type {string | number | null} 当前 thought 流的 ACP messageId（变化时视为新段落） */
+let currentThoughtMessageId = null;
+
 /** @typedef {{ data: ToolUpdateData, toolCallIds: Set<string>, mergedParts: ToolUpdateData[], userToggled?: boolean, parentGroup?: ToolGroupEntry | null }} ToolBlockEntry */
 
 /** @typedef {{ block: HTMLElement, header: HTMLElement, statusEl: HTMLElement, body: HTMLElement, children: ToolBlockEntry[], userToggled?: boolean }} ToolGroupEntry */
@@ -442,7 +445,10 @@ function handleServerMessage(msg) {
 
     case "thought":
       trackSeq(msg);
-      appendThoughtChunk(/** @type {string} */ (msg.text));
+      appendThoughtChunk(
+        /** @type {string} */ (msg.text),
+        msg.messageId ?? null
+      );
       break;
 
     case "message":
@@ -715,7 +721,10 @@ function applySyncEvent(event) {
       break;
 
     case "thought":
-      appendThoughtChunk(/** @type {string} */ (event.text));
+      appendThoughtChunk(
+        /** @type {string} */ (event.text),
+        event.messageId ?? null
+      );
       break;
 
     case "message":
@@ -984,6 +993,7 @@ function appendUserBubble(text, images = []) {
 function finalizeThoughtSegment() {
   if (!currentThoughtBlock) {
     thoughtRawBuffer = "";
+    currentThoughtMessageId = null;
     return;
   }
 
@@ -1012,6 +1022,7 @@ function finalizeThoughtSegment() {
   currentThoughtBody = null;
   currentThoughtHeader = null;
   thoughtRawBuffer = "";
+  currentThoughtMessageId = null;
 }
 
 /**
@@ -1041,6 +1052,7 @@ function finalizeCurrentStreamSegment() {
     // 仅有不可见字符、尚未建块时被其它类型打断 — 丢弃累积
     console.log("[app] 丢弃未呈现的思考累积 rawLen=", thoughtRawBuffer.length);
     thoughtRawBuffer = "";
+    currentThoughtMessageId = null;
   }
   currentStreamSegment = null;
 }
@@ -1111,6 +1123,7 @@ function resetTurnStreamingState() {
   currentThoughtBody = null;
   currentThoughtHeader = null;
   thoughtRawBuffer = "";
+  currentThoughtMessageId = null;
   toolBlocksMap.clear();
   toolSignatureMap.clear();
   savedToolIds.clear();
@@ -1132,9 +1145,10 @@ const THOUGHT_SEPARATOR_LINE_RE =
  */
 function normalizeThoughtText(raw) {
   if (!raw) return "";
-  const stripped = raw.replace(THOUGHT_INVISIBLE_RE, "");
+  // ponytail: Composer 流里偶发 \r 换行，统一成 \n 以免多行被压成一行
+  const stripped = raw.replace(THOUGHT_INVISIBLE_RE, "").replace(/\r/g, "\n");
   return stripped
-    .split(/\r?\n/)
+    .split(/\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !THOUGHT_SEPARATOR_LINE_RE.test(line))
     .join("\n")
@@ -1151,13 +1165,53 @@ function hasVisibleThoughtContent(text) {
 }
 
 /**
+ * 合并 thought 流式 chunk — 兼容增量 delta、前缀全量快照、按行/按 messageId 分段
+ * ponytail: 复用 appendStreamTextField；互不包含的全量行用换行衔接，避免只剩最后一行
+ * @param {string} prev
+ * @param {string} chunk
+ * @param {string | number | null} [messageId]
+ * @returns {string}
+ */
+function mergeThoughtStreamChunk(prev, chunk, messageId = null) {
+  if (!chunk) return prev;
+  if (!prev) return chunk;
+
+  // ACP：messageId 变化表示新的 thought 消息，段落间换行衔接
+  if (
+    messageId != null &&
+    currentThoughtMessageId != null &&
+    messageId !== currentThoughtMessageId
+  ) {
+    const sep = prev.endsWith("\n") ? "" : "\n";
+    console.log("[app] thought messageId 变化", currentThoughtMessageId, "→", messageId);
+    return prev + sep + chunk;
+  }
+
+  const merged = appendStreamTextField(prev, chunk);
+  if (merged === undefined) return prev;
+  // 前缀全量快照或 token 增量
+  if (merged !== prev + chunk) return merged;
+
+  // ponytail: 短片段 / 行内续写视为 token 增量；互不包含的长 chunk 视为新行
+  if (chunk.startsWith(" ") || chunk.startsWith("\t") || chunk.length <= 4) {
+    return merged;
+  }
+  if (!prev.endsWith("\n") && !chunk.startsWith("\n")) {
+    return prev + "\n" + chunk;
+  }
+  return merged;
+}
+
+/**
  * 追加思考内容块（流式增量，默认展开）
  * @param {string} chunk
+ * @param {string | number | null} [messageId]
  */
-function appendThoughtChunk(chunk) {
+function appendThoughtChunk(chunk, messageId = null) {
   if (!chunk) return;
 
-  thoughtRawBuffer += chunk;
+  thoughtRawBuffer = mergeThoughtStreamChunk(thoughtRawBuffer, chunk, messageId);
+  if (messageId != null) currentThoughtMessageId = messageId;
   const display = normalizeThoughtText(thoughtRawBuffer);
   if (!display) {
     console.log("[app] thought 累积中（暂无可显示内容） rawLen=", thoughtRawBuffer.length);
@@ -4242,6 +4296,22 @@ console.assert(
   "[app] normalizeThoughtText 自检失败"
 );
 console.assert(!hasVisibleThoughtContent("────────"), "[app] hasVisibleThoughtContent 自检失败");
+console.assert(
+  mergeThoughtStreamChunk("line1", "line2") === "line1\nline2",
+  "[app] mergeThoughtStreamChunk 按行快照 自检失败"
+);
+console.assert(
+  mergeThoughtStreamChunk("hello", "hello world") === "hello world",
+  "[app] mergeThoughtStreamChunk 前缀快照 自检失败"
+);
+console.assert(
+  mergeThoughtStreamChunk("hel", "lo") === "hello",
+  "[app] mergeThoughtStreamChunk token 增量 自检失败"
+);
+console.assert(
+  normalizeThoughtText("a\rb\rc") === "a\nb\nc",
+  "[app] normalizeThoughtText \\r 自检失败"
+);
 console.assert(
   computeToolSignature({ toolName: "Read", title: "a", rawInput: { path: "/x" } }) ===
     computeToolSignature({ toolName: "Read", title: "a", rawInput: { path: "/x" } }),
